@@ -102,7 +102,7 @@ export function CreditNoteForm({ id, invoiceId }: { id?: string; invoiceId?: str
       </Card>
       <section>
         <div className="section-title">Credited lines <span style={{ fontSize: 12, fontWeight: 400, color: 'var(--ink-3)' }}>· quantity capped at the returnable balance of each invoice line</span></div>
-        <LineItemGrid lines={doc.lines} onChange={setLines} partyId={doc.partyId} currency={doc.currency} totals={doc.totals} sourceLinked showWarehouse={doc.goodsReturn} showBatch={doc.goodsReturn} extraColumns={[{ key: 'ret', label: 'Returnable', width: 90, render: (l) => { const src = invLine(l); return <span style={{ fontSize: 12 }}>{src ? `${fmtQty(returnableQty(src))} of ${fmtQty(src.qty)}` : '—'}</span>; } }]} />
+        <LineItemGrid lines={doc.lines} onChange={setLines} partyId={doc.partyId} currency={doc.currency} totals={doc.totals} sourceLinked showWarehouse={doc.goodsReturn} showBatch={doc.goodsReturn} stockDirection="in" extraColumns={[{ key: 'ret', label: 'Returnable', width: 90, render: (l) => { const src = invLine(l); return <span style={{ fontSize: 12 }}>{src ? `${fmtQty(returnableQty(src))} of ${fmtQty(src.qty)}` : '—'}</span>; } }]} />
         <div style={{ marginTop: 8 }}><Button variant="link" onClick={() => { const fresh = creditNoteFromInvoice(inv); set({ lines: fresh.lines }); }}>Reset to all returnable lines</Button></div>
       </section>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: 24, alignItems: 'start' }}>

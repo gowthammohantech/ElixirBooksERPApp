@@ -6,7 +6,7 @@ import type { DB } from '../db';
 import type {
   Account, AccountGroup, Branch, Company, Currency, Customer, Dimension, Employee, ExchangeRate, HsnCode, Item,
   LocalizationPack, NumberSeries, OperatingProfileTemplate, PaymentTerm, Period, Plan, PriceList, PriceListEntry,
-  ReasonCode, Role, Salesperson, Supplier, TaxRate, TdsSection, Tenant, Uom, User, Warehouse, WorkflowRule, DocumentTemplate,
+  ReasonCode, Role, Salesperson, Supplier, TaxRate, TdsSection, Tenant, Uom, User, Warehouse, WorkflowRule, DocumentTemplate, VoucherType,
 } from '../types';
 import { LAYOUT_PRESETS } from '../../lib/templates';
 import { C } from '../collections';
@@ -114,6 +114,9 @@ export const IDS = {
   accIT: 'acc_5520',
   accProfFees: 'acc_5530',
   accMisc: 'acc_5590',
+  accDiscountAllowed: 'acc_5580',
+  vtInvoice: 'vt_inv',
+  vtExport: 'vt_exp',
   accFxLoss: 'acc_5600',
   accScrap: 'acc_5700',
   accVariance: 'acc_5710',
@@ -286,7 +289,7 @@ export function seedOrg(): Partial<DB> {
         { id: 'reg_mh', type: 'GSTIN', number: '27AAAPL1234C1Z5', state: 'Maharashtra', stateCode: '27', branchId: IDS.brHO, status: 'Active' },
         { id: 'reg_gj', type: 'GSTIN', number: '24AAAPL1234C2Z3', state: 'Gujarat', stateCode: '24', branchId: IDS.brSurat, status: 'Active', isSez: true },
       ],
-      defaults: defaults(), status: 'Active',
+      defaults: defaults({ tax: { eInvoiceThreshold: 0, eWayBillThreshold: 50000, autoSubmitOnPost: false, provider: 'NIC IRP (sandbox)', gstr1DueDay: 11, gstr3bDueDay: 20, lutNumber: 'AD270426001234K', lutValidFrom: '2026-04-01', lutValidTo: '2027-03-31' } }), status: 'Active',
       onboarding: { nature: 'Done', legal: 'Done', address: 'Done', currency: 'Done', periods: 'Done', users: 'Done', masters: 'Done', opening: 'Done', bank: 'Done', numbering: 'Done', einvoice: 'Pending' },
     }),
     rec<Company>(IDS.gulf, {
@@ -565,6 +568,7 @@ export function seedMasters(): Partial<DB> {
     acc('acc_5550', '5550', 'Office Supplies', 'ag_opex', 'Expense'),
     acc('acc_5560', '5560', 'Entertainment', 'ag_opex', 'Expense'),
     acc(IDS.accMisc, '5590', 'Miscellaneous Expenses', 'ag_opex', 'Expense'),
+    acc(IDS.accDiscountAllowed, '5580', 'Discount Allowed', 'ag_opex', 'Expense'),
     acc(IDS.accFxLoss, '5600', 'Foreign Exchange Loss', 'ag_fin', 'Expense'),
     acc('acc_5610', '5610', 'Unrealised FX Loss', 'ag_fin', 'Expense'),
     acc(IDS.accScrap, '5700', 'Scrap & Rework', 'ag_cogs', 'Expense'),
@@ -703,6 +707,13 @@ export function seedMasters(): Partial<DB> {
     series('Consolidation', 'CONS-', 3, 'On save', undefined, { padding: 3, resetRule: 'Never', fy: 'ALL' }),
     series('Import', 'IMP-', 15, 'On save', undefined, { padding: 3, resetRule: 'Never', fy: 'ALL' }),
     series('Sales Invoice', 'INV/SRT/26-27/', 12, 'On post', IDS.brSurat),
+    // export invoices run on their own series through the EXP voucher type (FR-DOC: multiple series per document type)
+    rec<NumberSeries>('ns_salesinvoice_exp', { companyId: co, docType: 'Sales Invoice', fy: '2026-27', prefix: 'EXP/26-27/', suffix: '', padding: 4, next: 1, resetRule: 'FY', allocation: 'On post', status: 'Active', voids: [], voucherTypeId: IDS.vtExport }),
+  ];
+
+  const voucherTypes: VoucherType[] = [
+    rec<VoucherType>(IDS.vtInvoice, { companyId: co, code: 'INV', name: 'Tax invoice', docType: 'Sales Invoice', printTitle: 'Tax invoice', invoiceType: undefined, isDefault: true, status: 'Active' }),
+    rec<VoucherType>(IDS.vtExport, { companyId: co, code: 'EXP', name: 'Export invoice', docType: 'Sales Invoice', printTitle: 'Export invoice', invoiceType: 'EXPWOP', isDefault: false, status: 'Active' }),
   ];
 
   const paymentTerms: PaymentTerm[] = [
@@ -775,7 +786,7 @@ export function seedMasters(): Partial<DB> {
     [C.warehouses]: warehouses as any, [C.priceLists]: priceLists as any, [C.priceListEntries]: priceListEntries as any,
     [C.accountGroups]: groups as any, [C.accounts]: accounts as any, [C.dimensions]: dimensions as any, [C.taxRates]: taxRates as any,
     [C.tdsSections]: tdsSections as any, [C.currencies]: currencies as any, [C.exchangeRates]: exchangeRates as any,
-    [C.numberSeries]: numberSeries as any, [C.paymentTerms]: paymentTerms as any, [C.uoms]: uoms as any, [C.hsnCodes]: hsnCodes as any,
+    [C.numberSeries]: numberSeries as any, [C.voucherTypes]: voucherTypes as any, [C.paymentTerms]: paymentTerms as any, [C.uoms]: uoms as any, [C.hsnCodes]: hsnCodes as any,
     [C.reasonCodes]: reasonCodes as any, [C.salespersons]: salespersons as any, [C.workflowRules]: workflowRules as any, [C.countries]: countries as any,
   };
 }

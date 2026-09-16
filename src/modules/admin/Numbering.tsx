@@ -1,7 +1,7 @@
 // Number series (FR-DOC-001..004): register + drawer editor with live preview, void log per series, void-a-number action.
 import { useMemo, useState } from 'react';
-import { db, C, engine, useCollection, useSession } from '../../store';
-import type { NumberSeries, Branch } from '../../store';
+import { db, C, engine, nav, useCollection, useSession } from '../../store';
+import type { NumberSeries, Branch, VoucherType } from '../../store';
 import { fmtDateTime, fiscalYearOf, today } from '../../lib/format';
 import { RegisterPage, Badge, Button, Drawer, TextField, SelectField, NumberField, RadioCards, Toggle, Identifier, TwoLine, Banner, useToast, ConfirmDialog, KV, Explain } from '../../components/ui';
 import type { Column } from '../../components/ui';
@@ -15,6 +15,8 @@ export default function Numbering() {
   const toast = useToast();
   const rows = useCollection<NumberSeries>(C.numberSeries).filter((x) => x.companyId === co?.id);
   const branches = useCollection<Branch>(C.branches).filter((b) => b.companyId === co?.id);
+  const voucherTypes = useCollection<VoucherType>(C.voucherTypes).filter((v) => v.companyId === co?.id);
+  const vtName = (id?: string) => voucherTypes.find((v) => v.id === id)?.name;
   const [edit, setEdit] = useState<Partial<NumberSeries> | null>(null);
   const [voidFor, setVoidFor] = useState<NumberSeries | null>(null);
   const [voidNo, setVoidNo] = useState('');
@@ -28,11 +30,11 @@ export default function Numbering() {
     if (!edit) return;
     if (!edit.docType) { toast.error('Document type is required'); return; }
     if (!edit.prefix && !edit.suffix) { toast.error('A prefix or suffix is required so numbers stay unique across types'); return; }
-    const dup = rows.find((r) => r.id !== edit.id && r.docType === edit.docType && (r.branchId ?? '') === (edit.branchId ?? '') && r.fy === edit.fy && r.status === 'Active');
-    if (dup && (edit.status ?? 'Active') === 'Active') { toast.error(`An active series already exists for ${edit.docType} · ${edit.fy} · ${branches.find((b) => b.id === edit.branchId)?.name ?? 'all branches'}`); return; }
+    const dup = rows.find((r) => r.id !== edit.id && r.docType === edit.docType && (r.branchId ?? '') === (edit.branchId ?? '') && (r.voucherTypeId ?? '') === (edit.voucherTypeId ?? '') && r.fy === edit.fy && r.status === 'Active');
+    if (dup && (edit.status ?? 'Active') === 'Active') { toast.error(`An active series already exists for ${edit.docType} · ${edit.fy} · ${branches.find((b) => b.id === edit.branchId)?.name ?? 'all branches'}${edit.voucherTypeId ? ` · ${vtName(edit.voucherTypeId)}` : ''}`); return; }
     const existing = edit.id ? rows.find((r) => r.id === edit.id) : undefined;
     if (existing && (edit.next ?? 1) < existing.next) { toast.error(`Next number cannot go below ${existing.next} — issued numbers are never reused (FR-DOC-004)`); return; }
-    const payload = { docType: edit.docType, branchId: edit.branchId || undefined, fy: edit.fy ?? fy, prefix: edit.prefix ?? '', suffix: edit.suffix ?? '', padding: edit.padding ?? 4, next: edit.next ?? 1, resetRule: edit.resetRule ?? 'FY', allocation: edit.allocation ?? 'On post', status: edit.status ?? 'Active' } as Partial<NumberSeries>;
+    const payload = { docType: edit.docType, branchId: edit.branchId || undefined, voucherTypeId: edit.voucherTypeId || undefined, fy: edit.fy ?? fy, prefix: edit.prefix ?? '', suffix: edit.suffix ?? '', padding: edit.padding ?? 4, next: edit.next ?? 1, resetRule: edit.resetRule ?? 'FY', allocation: edit.allocation ?? 'On post', status: edit.status ?? 'Active' } as Partial<NumberSeries>;
     if (existing) { db.update<NumberSeries>(C.numberSeries, existing.id, payload); engine.audit({ action: 'numbering.updated', objectType: 'NumberSeries', objectId: existing.id, objectNumber: payload.docType, before: { prefix: existing.prefix, next: existing.next, padding: existing.padding }, after: { prefix: payload.prefix, next: payload.next, padding: payload.padding } }); }
     else { const r = db.insert<NumberSeries>(C.numberSeries, { ...payload, companyId: co.id, voids: [] }); engine.audit({ action: 'numbering.created', objectType: 'NumberSeries', objectId: r.id, objectNumber: payload.docType, detail: fmt(payload as any, payload.next!) }); }
     toast.success('Number series saved');
@@ -40,7 +42,7 @@ export default function Numbering() {
   };
 
   const columns: Column<NumberSeries>[] = [
-    { key: 'docType', label: 'Document type', sortable: true, render: (r) => <TwoLine primary={r.docType} secondary={r.branchId ? branches.find((b) => b.id === r.branchId)?.name ?? r.branchId : 'All branches'} /> },
+    { key: 'docType', label: 'Document type', sortable: true, render: (r) => <TwoLine primary={<span>{r.docType}{r.voucherTypeId ? <Badge status="Draft">{vtName(r.voucherTypeId) ?? 'voucher type'}</Badge> : null}</span>} secondary={r.branchId ? branches.find((b) => b.id === r.branchId)?.name ?? r.branchId : 'All branches'} /> },
     { key: 'prefix', label: 'Prefix · suffix', render: (r) => <span className="identifier" style={{ fontSize: 12 }}>{r.prefix || '—'}{r.suffix ? ` · ${r.suffix}` : ''}</span> },
     { key: 'fy', label: 'FY', render: (r) => <span className="identifier" style={{ fontSize: 12 }}>{r.fy}</span> },
     { key: 'next', label: 'Next number', sortable: true, value: (r) => r.next, render: (r) => <Identifier style={{ color: 'var(--accent)', fontWeight: 600 }}>{fmt(r, r.next)}</Identifier> },
@@ -62,7 +64,7 @@ export default function Numbering() {
         entity="number series"
         columns={columns}
         searchKeys={['docType', 'prefix', 'fy']}
-        tabs={[{ id: 'all', label: 'All' }, { id: 'active', label: 'Active', filter: (r) => r.status === 'Active' }, { id: 'branch', label: 'Branch-specific', filter: (r) => !!r.branchId }, { id: 'voids', label: 'With voids', filter: (r) => r.voids.length > 0 }]}
+        tabs={[{ id: 'all', label: 'All' }, { id: 'active', label: 'Active', filter: (r) => r.status === 'Active' }, { id: 'branch', label: 'Branch-specific', filter: (r) => !!r.branchId }, { id: 'vt', label: 'Voucher types', filter: (r) => !!r.voucherTypeId }, { id: 'voids', label: 'With voids', filter: (r) => r.voids.length > 0 }]}
         filters={[{ key: 'fy', label: 'FY', type: 'select', options: fys.map((f) => ({ value: f, label: f })) }, { key: 'allocation', label: 'Allocation', type: 'select', options: [{ value: 'On save', label: 'On save' }, { value: 'On post', label: 'On post' }] }]}
         applyFilter={(r, v) => (!v.fy || r.fy === v.fy) && (!v.allocation || r.allocation === v.allocation)}
         primaryAction={{ label: 'New series', onClick: () => setEdit({ fy, padding: 4, next: 1, resetRule: 'FY', allocation: 'On post', status: 'Active', prefix: '', suffix: '' }), disabled: !canEdit, reason: canEdit ? undefined : 'Requires admin.numbering.edit' }}
@@ -85,6 +87,7 @@ export default function Numbering() {
               <SelectField label="Document type" required value={edit.docType ?? ''} onChange={(v) => setEdit({ ...edit, docType: v, prefix: edit.prefix || `${v.split(' ').map((w) => w[0]).join('').toUpperCase()}/${fy.includes('-') ? fy.slice(2) : fy}/` })} options={DOC_TYPES} placeholder="— Select —" disabled={!!edit.id} />
               <SelectField label="Branch" value={edit.branchId ?? ''} onChange={(v) => setEdit({ ...edit, branchId: v || undefined })} options={branches.map((b) => ({ value: b.id, label: b.name }))} allowEmpty placeholder="All branches" help="Branch series take precedence over the company-wide series" />
             </div>
+            <SelectField label="Voucher type" value={edit.voucherTypeId ?? ''} onChange={(v) => { const vt = voucherTypes.find((x) => x.id === v); setEdit({ ...edit, voucherTypeId: v || undefined, prefix: vt && !edit.id ? `${vt.code}/${(edit.fy ?? fy).includes('-') ? (edit.fy ?? fy).slice(2) : edit.fy ?? fy}/` : edit.prefix }); }} options={voucherTypes.filter((v) => !edit.docType || v.docType === edit.docType).map((v) => ({ value: v.id, label: `${v.name} (${v.code})` }))} allowEmpty placeholder="None — default series for the document type" help={<span>Several series for one document type (domestic, export, service…) are keyed by voucher type · <span className="link" onClick={() => nav.go('admin/voucher-types')}>manage voucher types</span></span>} />
             <div className="grid-3">
               <TextField label="Prefix" value={edit.prefix ?? ''} onChange={(v) => setEdit({ ...edit, prefix: v })} placeholder="INV/26-27/" />
               <TextField label="Suffix" value={edit.suffix ?? ''} onChange={(v) => setEdit({ ...edit, suffix: v })} placeholder="optional" />

@@ -97,7 +97,7 @@ export default function Templates() {
 
   // Effective style of the draft — toggles show the resolved value even when the field is unset.
   const st = edit ? resolveTemplateStyle(edit, co) : null;
-  const styleToggle = (key: 'showLogo' | 'showHsn' | 'showDiscount' | 'showTaxColumn' | 'showTaxBreakup' | 'showAmountInWords' | 'showBankDetails' | 'showSignatory', label: string, help?: string) =>
+  const styleToggle = (key: 'showLogo' | 'showHsn' | 'showDiscount' | 'showTaxColumn' | 'showTaxBreakup' | 'showChargeBreakup' | 'showAmountInWords' | 'showBankDetails' | 'showSignatory', label: string, help?: string) =>
     edit && st ? <Toggle on={st[key]} onChange={(v) => setEdit({ ...edit, [key]: v })} label={label} help={help} /> : null;
 
   return (
@@ -175,6 +175,7 @@ export default function Templates() {
                       {styleToggle('showDiscount', 'Discount column')}
                       {styleToggle('showTaxColumn', 'Per-line tax column')}
                       {styleToggle('showTaxBreakup', 'Tax breakup table')}
+                      {styleToggle('showChargeBreakup', 'Itemise charges', 'Freight, packing, insurance… each with its taxable value and tax (an invoice can override this)')}
                       {styleToggle('showAmountInWords', 'Amount in words')}
                       {styleToggle('showBankDetails', 'Bank details (masked)')}
                       {styleToggle('showSignatory', 'Authorised signatory block')}

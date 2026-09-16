@@ -8,7 +8,7 @@ import { currentScope } from './session';
 import type {
   Branch, Account, ApprovalRequest, ApprovalStepState, Company, Customer, DocHeader, DocLine, DocTotals, ExchangeRate, Item, Journal, JournalLine,
   NumberSeries, OpenItem, Period, PriceListEntry, Reservation, StockMovement, StockMoveType, Supplier, TaxBreakupRow, TaxRate, User,
-  WorkflowRule, Notification, AuditEvent, Role, ID, TdsSection,
+  WorkflowRule, Notification, AuditEvent, Role, ID, TdsSection, InvoiceType, DocDiscount, ChargeBreakupRow, LineBreakup, VoucherType,
 } from './types';
 import { addDays, correlationId, fiscalYearOf, periodCodeOf, round, today, uid } from '../lib/format';
 
@@ -90,36 +90,58 @@ function formatNumber(s: NumberSeries, n: number) {
   return `${s.prefix}${String(n).padStart(s.padding, '0')}${s.suffix}`;
 }
 
-export function previewNumber(docType: string, opts: { branchId?: string; date?: string; companyId?: string } = {}): string {
+export interface SeriesOpts { branchId?: string; date?: string; companyId?: string; voucherTypeId?: string }
+
+export function previewNumber(docType: string, opts: SeriesOpts = {}): string {
   const s = findSeries(docType, opts);
   return s ? formatNumber(s, s.next) : `${docType.toUpperCase().slice(0, 3)}/—`;
 }
 
-export function findSeries(docType: string, opts: { branchId?: string; date?: string; companyId?: string } = {}): NumberSeries | undefined {
+/**
+ * Resolve the active series: a voucher type's own series first (branch, then company-wide), otherwise
+ * the document type's default series — one that belongs to no voucher type — so a second series
+ * (export, service…) never hijacks ordinary numbering.
+ */
+export function findSeries(docType: string, opts: SeriesOpts = {}): NumberSeries | undefined {
   const c = ctx();
   const cid = opts.companyId ?? c.companyId;
   const fy = fiscalYearOf(opts.date ?? today(), c.fyStartMonth);
+  const branchId = opts.branchId ?? c.branchId;
   const all = db.where<NumberSeries>(C.numberSeries, (s) => s.companyId === cid && s.docType === docType && s.status === 'Active');
-  const byBranch = all.find((s) => s.branchId && s.branchId === (opts.branchId ?? c.branchId) && (s.fy === fy || s.fy === 'ALL'));
-  return byBranch ?? all.find((s) => !s.branchId && (s.fy === fy || s.fy === 'ALL')) ?? all.find((s) => !s.branchId);
+  const pick = (pool: NumberSeries[]) => pool.find((s) => s.branchId && s.branchId === branchId && (s.fy === fy || s.fy === 'ALL')) ?? pool.find((s) => !s.branchId && (s.fy === fy || s.fy === 'ALL')) ?? pool.find((s) => !s.branchId);
+  if (opts.voucherTypeId) {
+    const own = pick(all.filter((s) => s.voucherTypeId === opts.voucherTypeId));
+    if (own) return own;
+  }
+  return pick(all.filter((s) => !s.voucherTypeId));
+}
+
+/** Default voucher type for a document type (branch-specific first), if the company has defined any. */
+export function defaultVoucherType(docType: string, opts: { branchId?: string; companyId?: string } = {}): VoucherType | undefined {
+  const c = ctx();
+  const cid = opts.companyId ?? c.companyId;
+  const branchId = opts.branchId ?? c.branchId;
+  const all = db.where<VoucherType>(C.voucherTypes, (v) => v.companyId === cid && v.docType === docType && v.status === 'Active');
+  return all.find((v) => v.isDefault && v.branchId === branchId) ?? all.find((v) => v.isDefault && !v.branchId) ?? undefined;
 }
 
 /** Allocate the next number for a document type — concurrency-safe within this store; never reuses. */
-export function allocateNumber(docType: string, opts: { branchId?: string; date?: string; companyId?: string } = {}): string {
+export function allocateNumber(docType: string, opts: SeriesOpts = {}): string {
   let s = findSeries(docType, opts);
   if (!s) {
     const c = ctx();
     const fy = fiscalYearOf(opts.date ?? today(), c.fyStartMonth);
-    const short = docType.split(' ').map((w) => w[0]).join('').toUpperCase();
-    s = db.insert<NumberSeries>(C.numberSeries, { companyId: opts.companyId ?? c.companyId, docType, fy, prefix: `${short}/${fy}/`, suffix: '', padding: 4, next: 1, resetRule: 'FY', allocation: 'On post', status: 'Active', voids: [] });
+    const vt = db.find<VoucherType>(C.voucherTypes, opts.voucherTypeId);
+    const short = vt?.code ?? docType.split(' ').map((w) => w[0]).join('').toUpperCase();
+    s = db.insert<NumberSeries>(C.numberSeries, { companyId: opts.companyId ?? c.companyId, docType, fy, prefix: `${short}/${fy}/`, suffix: '', padding: 4, next: 1, resetRule: 'FY', allocation: 'On post', status: 'Active', voids: [], voucherTypeId: vt?.id });
   }
   const number = formatNumber(s, s.next);
   db.update<NumberSeries>(C.numberSeries, s.id, { next: s.next + 1 });
   return number;
 }
 
-export function voidNumber(docType: string, number: string, reason: string) {
-  const s = findSeries(docType);
+export function voidNumber(docType: string, number: string, reason: string, opts: SeriesOpts = {}) {
+  const s = findSeries(docType, opts);
   if (!s) return;
   db.update<NumberSeries>(C.numberSeries, s.id, { voids: [...s.voids, { number, reason, at: new Date().toISOString(), by: ctx().userName }] });
   audit({ action: 'numbering.void', objectType: 'NumberSeries', objectId: s.id, objectNumber: number, detail: reason });
@@ -136,6 +158,31 @@ export interface TaxContext {
   /** 'sale' → output tax; 'purchase' → input tax */
   direction: 'sale' | 'purchase';
   companyId?: string;
+  /** document-level GST supply type; when set it overrides the party-treatment default (sales invoices) */
+  invoiceType?: InvoiceType;
+  /** document-level reverse charge: every taxable line is computed but not charged */
+  reverseCharge?: boolean;
+}
+
+export const INVOICE_TYPES: { value: InvoiceType; label: string; short: string; zeroRated: boolean; igst: boolean }[] = [
+  { value: 'Regular', label: 'Regular (B2B / B2C)', short: 'Regular', zeroRated: false, igst: false },
+  { value: 'SEZWP', label: 'SEZ — with payment of tax', short: 'SEZ with tax', zeroRated: false, igst: true },
+  { value: 'SEZWOP', label: 'SEZ — without payment of tax (LUT / bond)', short: 'SEZ under LUT', zeroRated: true, igst: true },
+  { value: 'EXPWP', label: 'Export — with payment of tax', short: 'Export with IGST', zeroRated: false, igst: true },
+  { value: 'EXPWOP', label: 'Export — without payment of tax (LUT / bond)', short: 'Export under LUT', zeroRated: true, igst: true },
+  { value: 'DEXP', label: 'Deemed export', short: 'Deemed export', zeroRated: false, igst: false },
+];
+
+export function invoiceTypeInfo(t?: InvoiceType) {
+  return INVOICE_TYPES.find((x) => x.value === (t ?? 'Regular')) ?? INVOICE_TYPES[0];
+}
+
+/** Supply type a customer's tax treatment implies (used as the default when a document is created). */
+export function invoiceTypeForTreatment(treatment?: string): InvoiceType {
+  if (treatment === 'SEZ') return 'SEZWOP';
+  if (treatment === 'Export' || treatment === 'Overseas') return 'EXPWOP';
+  if (treatment === 'Deemed Export') return 'DEXP';
+  return 'Regular';
 }
 
 export interface LineTaxResult {
@@ -161,26 +208,30 @@ export function computeLineTax(line: { qty: number; rate: number; discountPct?: 
   if (!tr) return { taxable, taxAmt: 0, components: {}, rate: 0, treatment: 'Untaxed', reverseCharge: false, explanation: ['No tax rate on line'], ruleVersion: '—', interState: false };
 
   const partyTreat = tc.treatment ?? 'Registered';
-  const zeroRatedParty = partyTreat === 'SEZ' || partyTreat === 'Export' || partyTreat === 'Overseas' || partyTreat === 'Deemed Export';
+  // The document's supply type wins; a document without one (older documents, other document types)
+  // falls back to the customer master's treatment (FR-TAX-002).
+  const it = tc.invoiceType ? invoiceTypeInfo(tc.invoiceType) : undefined;
+  const zeroRatedParty = it ? it.zeroRated : partyTreat === 'SEZ' || partyTreat === 'Export' || partyTreat === 'Overseas' || partyTreat === 'Deemed Export';
   let effRate = tr.rate;
   let treatment: string = tr.treatment;
   if (tr.treatment !== 'Taxable' || zeroRatedParty) {
     effRate = 0;
-    treatment = zeroRatedParty ? 'Zero-rated (SEZ/Export)' : tr.treatment;
+    treatment = zeroRatedParty ? (it ? `Zero-rated (${it.short})` : 'Zero-rated (SEZ/Export)') : tr.treatment;
     expl.push(`${treatment}: no tax charged (${tr.ruleVersion})`);
   }
   if (line.taxInclusive && effRate > 0) {
     taxable = round(taxable / (1 + effRate / 100));
     expl.push('Price is tax-inclusive — taxable value backed out');
   }
-  const interState = !!tc.sellerStateCode && !!tc.buyerStateCode && tc.sellerStateCode !== tc.buyerStateCode;
+  // SEZ and export supplies are inter-state by law (IGST) whatever the place of supply says.
+  const interState = (it?.igst ?? false) || (!!tc.sellerStateCode && !!tc.buyerStateCode && tc.sellerStateCode !== tc.buyerStateCode);
   const components: Record<string, number> = {};
   let taxAmt = 0;
   if (effRate > 0) {
     if (pack === 'IN' && tr.type === 'GST') {
       if (interState || partyTreat === 'Overseas') {
         components.IGST = round((taxable * effRate) / 100);
-        expl.push(`Inter-state supply (${tc.sellerStateCode} → ${tc.buyerStateCode ?? '—'}): IGST ${effRate}%`);
+        expl.push(it?.igst ? `${it.label}: IGST ${effRate}%` : `Inter-state supply (${tc.sellerStateCode} → ${tc.buyerStateCode ?? '—'}): IGST ${effRate}%`);
       } else {
         components.CGST = round((taxable * effRate) / 200);
         components.SGST = round((taxable * effRate) / 200);
@@ -197,29 +248,59 @@ export function computeLineTax(line: { qty: number; rate: number; discountPct?: 
     }
     taxAmt = round(Object.values(components).reduce((a, b) => a + b, 0));
   }
-  if (tr.reverseCharge) expl.push('Reverse charge: tax payable by recipient, not added to invoice total');
-  return { taxable, taxAmt, components, rate: effRate, treatment, reverseCharge: tr.reverseCharge, explanation: expl, ruleVersion: tr.ruleVersion, interState };
+  const reverseCharge = !!tc.reverseCharge || tr.reverseCharge;
+  if (reverseCharge && taxAmt > 0) expl.push('Reverse charge: tax payable by recipient, shown on the invoice but not added to the total');
+  return { taxable, taxAmt, components, rate: effRate, treatment, reverseCharge, explanation: expl, ruleVersion: tr.ruleVersion, interState };
+}
+
+/**
+ * Apportion a document-level discount across lines in proportion to their taxable value (after line
+ * discounts), so each GST rate bears its share. Rounding remainder lands on the largest line.
+ */
+export function apportionDocDiscount(bases: number[], amount: number): number[] {
+  const total = bases.reduce((s, b) => s + b, 0);
+  if (amount <= 0 || total <= 0) return bases.map(() => 0);
+  const shares = bases.map((b) => round((amount * b) / total));
+  const diff = round(amount - shares.reduce((s, x) => s + x, 0));
+  if (diff !== 0) {
+    const i = bases.indexOf(Math.max(...bases));
+    shares[i] = round(shares[i] + diff);
+  }
+  return shares;
 }
 
 /** Recalculate every line + totals for a document. Mutates copies, returns new lines/totals. */
 export function computeDocument(
   lines: DocLine[],
   tc: TaxContext,
-  opts: { charges?: { name: string; amount: number; taxRateId?: string }[]; tdsSectionId?: string; tdsBase?: 'taxable' | 'total'; roundTotal?: boolean; paid?: number; credited?: number; writtenOff?: number; rate?: number; taxInclusive?: boolean } = {},
+  opts: { charges?: { id?: string; name: string; amount: number; taxRateId?: string }[]; tdsSectionId?: string; tdsBase?: 'taxable' | 'total'; roundTotal?: boolean; paid?: number; credited?: number; writtenOff?: number; rate?: number; taxInclusive?: boolean; docDiscount?: DocDiscount } = {},
 ): { lines: DocLine[]; totals: DocTotals } {
-  const outLines = lines.map((l) => {
+  // Line discount first (a percentage is the source of truth — see below), then the document-level
+  // "before tax" discount is apportioned across the remaining taxable values so every GST rate bears
+  // its share (FR-TAX: discount shown on the invoice reduces the taxable value).
+  const lineDisc = lines.map((l) => {
+    const byPct = (l.discountPct || 0) > 0;
+    const gross = round(l.qty * l.rate);
+    return round(byPct ? (gross * (l.discountPct || 0)) / 100 : l.discountAmt || 0);
+  });
+  const bases = lines.map((l, i) => Math.max(0, round(round(l.qty * l.rate) - lineDisc[i])));
+  const dd = opts.docDiscount;
+  const baseSum = round(bases.reduce((s, b) => s + b, 0));
+  const docDiscountRaw = dd && dd.value > 0 ? round(dd.mode === 'pct' ? (baseSum * Math.min(dd.value, 100)) / 100 : Math.min(dd.value, baseSum)) : 0;
+  const beforeTax = docDiscountRaw > 0 && !dd?.afterTax;
+  const shares = beforeTax ? apportionDocDiscount(bases, docDiscountRaw) : lines.map(() => 0);
+  const outLines = lines.map((l, i) => {
     // A percentage is the source of truth: `discountAmt` is derived from it and stored, and lines are
     // copied between documents at partial quantities (order → delivery → invoice, PO → GRN → bill), so
     // a stored amount must never survive a quantity change. Only a line with no % keeps an absolute amount.
-    const byPct = (l.discountPct || 0) > 0;
-    const gross = round(l.qty * l.rate);
-    const t = computeLineTax({ qty: l.qty, rate: l.rate, discountPct: l.discountPct, discountAmt: byPct ? undefined : l.discountAmt || undefined, taxRateId: l.taxRateId, taxInclusive: opts.taxInclusive }, tc);
-    const discountAmt = round(byPct ? (gross * (l.discountPct || 0)) / 100 : l.discountAmt || 0);
+    const discountAmt = lineDisc[i];
+    const t = computeLineTax({ qty: l.qty, rate: l.rate, discountAmt: round(discountAmt + shares[i]), taxRateId: l.taxRateId, taxInclusive: opts.taxInclusive }, tc);
     const item = db.find<Item>(C.items, l.itemId);
     return {
       ...l,
       hsn: l.hsn ?? item?.hsn,
       discountAmt,
+      docDiscountAmt: shares[i] || undefined,
       taxable: t.taxable,
       taxRate: t.rate,
       taxAmt: t.taxAmt,
@@ -233,35 +314,42 @@ export function computeDocument(
   const discount = round(outLines.reduce((s, l) => s + (l.discountAmt || 0), 0));
   const taxable = round(outLines.reduce((s, l) => s + l.taxable, 0));
   const components: Record<string, number> = {};
+  const rcmComponents: Record<string, number> = {};
   const breakupMap = new Map<string, TaxBreakupRow>();
+  const addBreakup = (key: string, seed: TaxBreakupRow, taxableAmt: number, taxAmt: number) => {
+    const row = breakupMap.get(key) ?? seed;
+    row.taxable = round(row.taxable + taxableAmt);
+    row.tax = round(row.tax + taxAmt);
+    breakupMap.set(key, row);
+  };
   outLines.forEach((l) => {
-    if (l.reverseCharge) return;
+    // Reverse-charge tax is shown (breakup row flagged) but belongs to the recipient, so it never
+    // enters `components` / `tax`; it is accumulated in `rcmComponents` for the print and GSTR-1.
+    const target = l.reverseCharge ? rcmComponents : components;
     Object.entries(l.taxComponents).forEach(([k, v]) => {
-      components[k] = round((components[k] ?? 0) + v);
+      target[k] = round((target[k] ?? 0) + v);
       const compRate = k === 'IGST' ? l.taxRate : k === 'CESS' ? (db.find<TaxRate>(C.taxRates, l.taxRateId)?.cessRate ?? 0) : k === 'CGST' || k === 'SGST' ? l.taxRate / 2 : l.taxRate;
-      const key = `${k}|${compRate}|${l.hsn ?? ''}`;
-      const row = breakupMap.get(key) ?? { component: k, rate: compRate, hsn: l.hsn ?? '—', taxable: 0, tax: 0 };
-      row.taxable = round(row.taxable + l.taxable);
-      row.tax = round(row.tax + v);
-      breakupMap.set(key, row);
+      addBreakup(`${k}|${compRate}|${l.hsn ?? ''}|${l.reverseCharge ? 'rcm' : ''}`, { component: k, rate: compRate, hsn: l.hsn ?? '—', taxable: 0, tax: 0, reverseCharge: l.reverseCharge || undefined }, l.taxable, v);
     });
   });
   let charges = 0;
-  (opts.charges ?? []).forEach((ch) => {
+  const chargeRows: ChargeBreakupRow[] = [];
+  (opts.charges ?? []).forEach((ch, i) => {
     charges = round(charges + ch.amount);
+    const row: ChargeBreakupRow = { id: ch.id ?? `chg_${i}`, name: ch.name, amount: round(ch.amount), taxRate: 0, tax: 0, components: {} };
     if (ch.taxRateId) {
       const t = computeLineTax({ qty: 1, rate: ch.amount, taxRateId: ch.taxRateId }, tc);
+      row.taxRate = t.rate; row.tax = t.taxAmt; row.components = t.components; row.reverseCharge = t.reverseCharge || undefined;
+      const target = t.reverseCharge ? rcmComponents : components;
       Object.entries(t.components).forEach(([k, v]) => {
-        components[k] = round((components[k] ?? 0) + v);
-        const key = `${k}|${t.rate}|charges`;
-        const row = breakupMap.get(key) ?? { component: k, rate: k === 'CGST' || k === 'SGST' ? t.rate / 2 : t.rate, hsn: 'Charges', taxable: 0, tax: 0 };
-        row.taxable = round(row.taxable + ch.amount);
-        row.tax = round(row.tax + v);
-        breakupMap.set(key, row);
+        target[k] = round((target[k] ?? 0) + v);
+        addBreakup(`${k}|${t.rate}|charges|${t.reverseCharge ? 'rcm' : ''}`, { component: k, rate: k === 'CGST' || k === 'SGST' ? t.rate / 2 : t.rate, hsn: 'Charges', taxable: 0, tax: 0, reverseCharge: t.reverseCharge || undefined }, ch.amount, v);
       });
     }
+    chargeRows.push(row);
   });
   const tax = round(Object.values(components).reduce((a, b) => a + b, 0));
+  const rcmTax = round(Object.values(rcmComponents).reduce((a, b) => a + b, 0));
   let tds = 0;
   let tdsSection: string | undefined;
   if (opts.tdsSectionId) {
@@ -274,7 +362,9 @@ export function computeDocument(
       }
     }
   }
-  const raw = round(taxable + tax + charges - tds);
+  // An "after tax" document discount only reduces what the customer pays — GST stays on the full value.
+  const afterTaxDiscount = docDiscountRaw > 0 && !!dd?.afterTax ? Math.min(docDiscountRaw, round(taxable + tax + charges)) : 0;
+  const raw = round(taxable + tax + charges - afterTaxDiscount - tds);
   const roundOff = opts.roundTotal === false ? 0 : round(Math.round(raw) - raw);
   const total = round(raw + roundOff);
   const paid = opts.paid ?? 0;
@@ -283,11 +373,63 @@ export function computeDocument(
   const rate = opts.rate ?? 1;
   return {
     lines: outLines,
-    totals: { subtotal, discount, taxable, tax, components, breakup: Array.from(breakupMap.values()), charges, tds, tdsSection, roundOff, total, paid, credited, writtenOff, due: round(total - paid - credited - writtenOff), baseTotal: round(total * rate) },
+    totals: {
+      subtotal, discount, taxable, tax, components, breakup: Array.from(breakupMap.values()), charges, tds, tdsSection, roundOff, total, paid, credited, writtenOff, due: round(total - paid - credited - writtenOff), baseTotal: round(total * rate),
+      docDiscount: docDiscountRaw > 0 ? (beforeTax ? docDiscountRaw : afterTaxDiscount) : undefined,
+      docDiscountAfterTax: docDiscountRaw > 0 && !!dd?.afterTax ? true : undefined,
+      rcmTax: rcmTax || undefined,
+      rcmComponents: rcmTax ? rcmComponents : undefined,
+      chargeRows: chargeRows.length ? chargeRows : undefined,
+    },
   };
 }
 
-export function taxContextFor(partyType: 'Customer' | 'Supplier' | undefined, partyId: string | undefined, direction: 'sale' | 'purchase', branchId?: string, placeOfSupplyCode?: string): TaxContext {
+/** On-hand quantity per batch / lot in a warehouse (FEFO order: earliest expiry first), plus in-stock serials per batch. */
+export function batchesOnHand(itemId: string, warehouseId?: string): { batch: string; onHand: number; expiryDate?: string; mfgDate?: string; serials: string[] }[] {
+  const moves = db.where<StockMovement>(C.stockMovements, (m) => m.itemId === itemId && (!warehouseId || m.warehouseId === warehouseId)).sort((a, b) => a.date.localeCompare(b.date) || a.createdAt.localeCompare(b.createdAt));
+  const map = new Map<string, { batch: string; onHand: number; expiryDate?: string; mfgDate?: string; serials: Set<string> }>();
+  moves.forEach((m) => {
+    const key = m.batch ?? '';
+    const row = map.get(key) ?? { batch: key, onHand: 0, expiryDate: undefined, mfgDate: undefined, serials: new Set<string>() };
+    row.onHand = round(row.onHand + m.baseQty, 3);
+    if (m.expiryDate) row.expiryDate = m.expiryDate;
+    (m.serials ?? []).forEach((sn) => (m.baseQty > 0 ? row.serials.add(sn) : row.serials.delete(sn)));
+    map.set(key, row);
+  });
+  return Array.from(map.values()).filter((r) => r.onHand > 0.0005 || r.serials.size > 0).map((r) => ({ ...r, serials: Array.from(r.serials) })).sort((a, b) => (a.expiryDate ?? '9999').localeCompare(b.expiryDate ?? '9999') || a.batch.localeCompare(b.batch));
+}
+
+/** Batch / lot / serial slices a line moves: its explicit breakup, else the single batch / serial list it carries. */
+export function lineStockRows(l: Pick<DocLine, 'batch' | 'serials' | 'breakup'>, qty: number): LineBreakup[] {
+  const rows = (l.breakup ?? []).filter((b) => b.qty > 0);
+  if (rows.length) return rows;
+  return [{ id: 'single', batch: l.batch || undefined, serials: l.serials?.length ? l.serials : undefined, qty }];
+}
+
+/** Validation of a line's batch / serial breakup against the item's tracking; returns human messages (empty = ok). */
+export function validateLineStock(l: Pick<DocLine, 'batch' | 'serials' | 'breakup'>, item: Pick<Item, 'tracking' | 'name'> | undefined, qty: number, opts: { direction: 'in' | 'out'; warehouseId?: string; itemId?: string; allowNegative?: boolean } = { direction: 'out' }): string[] {
+  const errs: string[] = [];
+  if (!item || item.tracking === 'None') return errs;
+  const rows = lineStockRows(l, qty);
+  const sum = round(rows.reduce((s, r) => s + r.qty, 0), 3);
+  if (rows.length > 1 && Math.abs(sum - qty) > 0.0005) errs.push(`${item.name}: batch / serial split totals ${sum}, line quantity is ${qty}`);
+  const seen = new Set<string>();
+  rows.forEach((r) => {
+    if (item.tracking === 'Batch' && !r.batch) errs.push(`${item.name}: batch / lot number is required${rows.length > 1 ? ' on every split row' : ''}`);
+    if (item.tracking === 'Serial') {
+      const n = r.serials?.length ?? 0;
+      if (n !== Math.round(r.qty)) errs.push(`${item.name}: ${Math.round(r.qty)} serial number(s) required${r.batch ? ` for lot ${r.batch}` : ''}, ${n} entered`);
+      (r.serials ?? []).forEach((sn) => { if (seen.has(sn)) errs.push(`${item.name}: serial ${sn} entered twice`); seen.add(sn); });
+    }
+    if (opts.direction === 'out' && opts.warehouseId && opts.itemId && !opts.allowNegative && r.batch) {
+      const pos = stockPosition(opts.itemId, opts.warehouseId, { batch: r.batch });
+      if (pos.onHand - r.qty < -0.0005) errs.push(`${item.name}: only ${pos.onHand} on hand in batch ${r.batch}, ${r.qty} requested`);
+    }
+  });
+  return errs;
+}
+
+export function taxContextFor(partyType: 'Customer' | 'Supplier' | undefined, partyId: string | undefined, direction: 'sale' | 'purchase', branchId?: string, placeOfSupplyCode?: string, extra: { invoiceType?: InvoiceType; reverseCharge?: boolean } = {}): TaxContext {
   const c = ctx();
   const company = c.company;
   const branch = db.find<Branch>(C.branches, branchId ?? c.branchId);
@@ -304,8 +446,8 @@ export function taxContextFor(partyType: 'Customer' | 'Supplier' | undefined, pa
     partyState = p?.addresses[0]?.address.stateCode ?? p?.gstin?.slice(0, 2);
     treatment = p?.taxTreatment;
   }
-  if (direction === 'sale') return { sellerStateCode: branchState, buyerStateCode: placeOfSupplyCode ?? partyState, treatment, direction, companyId: c.companyId };
-  return { sellerStateCode: partyState, buyerStateCode: branchState, treatment, direction, companyId: c.companyId };
+  if (direction === 'sale') return { sellerStateCode: branchState, buyerStateCode: placeOfSupplyCode ?? partyState, treatment, direction, companyId: c.companyId, invoiceType: extra.invoiceType, reverseCharge: extra.reverseCharge || undefined };
+  return { sellerStateCode: partyState, buyerStateCode: branchState, treatment, direction, companyId: c.companyId, reverseCharge: extra.reverseCharge || undefined };
 }
 
 // ── Pricing (FR-PRC-003) ───────────────────────────────────────────────────
@@ -1039,7 +1181,7 @@ export function newDocHeader(docType: string, partial: Partial<DocHeader> = {}):
 
 /** Generic: number allocation on post, status/period stamping and audit for any DocHeader collection. */
 export function markPosted<T extends DocHeader>(collection: string, doc: T, extra: Partial<T> = {}): T {
-  const number = doc.number.includes('DRAFT') || !doc.number ? allocateNumber(doc.docType, { date: doc.date, branchId: doc.branchId, companyId: doc.companyId }) : doc.number;
+  const number = doc.number.includes('DRAFT') || !doc.number ? allocateNumber(doc.docType, { date: doc.date, branchId: doc.branchId, companyId: doc.companyId, voucherTypeId: doc.voucherTypeId }) : doc.number;
   const out = db.update<T>(collection, doc.id, { ...extra, number, status: 'Posted', postedAt: new Date().toISOString(), postedBy: ctx().userName, period: periodCodeOf(doc.date) } as Partial<T>);
   audit({ action: `${doc.docType.toLowerCase().replace(/\s+/g, '_')}.posted`, objectType: doc.docType, objectId: doc.id, objectNumber: number, correlationId: doc.correlationId });
   return out;
@@ -1130,18 +1272,35 @@ function docLinkFor(collection: string, id: string) {
   return `${map[collection] ?? collection}/${id}`;
 }
 
+/** e-Invoicing covers B2B supplies to registered persons plus every export / SEZ / deemed-export supply. */
+export function eInvoiceApplicable(doc: Pick<DocHeader, 'partySnapshot' | 'invoiceType'>, pack?: string): boolean {
+  if ((pack ?? 'IN') !== 'IN') return false;
+  if (doc.invoiceType && doc.invoiceType !== 'Regular') return true;
+  return !!doc.partySnapshot?.gstin && doc.partySnapshot?.taxTreatment !== 'Unregistered';
+}
+
+/** IRP payload fragments for the GST supply type and the optional dispatch / ship-to blocks (e-invoice schema 1.1). */
+export function eInvoiceTransactionDetails(doc: DocHeader) {
+  const addr = (a?: { name?: string; gstin?: string; address: { line1: string; line2?: string; city: string; stateCode?: string; pin?: string } }) => a ? { Nm: a.name, Gstin: a.gstin, Addr1: a.address.line1, Addr2: a.address.line2, Loc: a.address.city, Pin: a.address.pin, Stcd: a.address.stateCode } : undefined;
+  return { SupTyp: doc.invoiceType === 'Regular' || !doc.invoiceType ? 'B2B' : doc.invoiceType, RegRev: doc.reverseCharge ? 'Y' : 'N', DispDtls: addr(doc.dispatchFrom), ShipDtls: addr(doc.shipTo) };
+}
+
 /** Readiness validation before IRP submission (FR-CMP-001). */
 export function eInvoiceReadiness(doc: DocHeader): { ok: boolean; issues: string[]; applicable: boolean } {
   const issues: string[] = [];
   const co = companyOf(doc.companyId);
   const branch = db.find<Branch>(C.branches, doc.branchId);
-  const applicable = (co?.localizationPack ?? 'IN') === 'IN' && !!doc.partySnapshot?.gstin && doc.partySnapshot?.taxTreatment !== 'Unregistered';
+  const applicable = eInvoiceApplicable(doc, co?.localizationPack);
   if (!applicable) return { ok: false, issues: ['e-Invoice not applicable (B2C / unregistered / non-India pack)'], applicable: false };
+  const exp = doc.invoiceType === 'EXPWP' || doc.invoiceType === 'EXPWOP';
   if (doc.status !== 'Posted') issues.push('Document must be posted');
   if (!branch?.gstin) issues.push('Seller GSTIN missing on branch');
-  if (!doc.partySnapshot?.gstin) issues.push('Buyer GSTIN missing');
-  if (!doc.partySnapshot?.billingAddress?.pin) issues.push('Buyer PIN code missing');
-  if (!doc.placeOfSupplyCode && !doc.partySnapshot?.stateCode) issues.push('Place of supply missing');
+  // Exports carry buyer GSTIN "URP" and PIN 999999 on the IRP schema, so neither is required here.
+  if (!exp && !doc.partySnapshot?.gstin) issues.push('Buyer GSTIN missing');
+  if (!exp && !doc.partySnapshot?.billingAddress?.pin) issues.push('Buyer PIN code missing');
+  if (doc.shipTo && !doc.shipTo.address.pin && !exp) issues.push('Ship-to PIN code missing');
+  if (doc.dispatchFrom && !doc.dispatchFrom.address.pin) issues.push('Dispatch-from PIN code missing');
+  if (!exp && !doc.placeOfSupplyCode && !doc.partySnapshot?.stateCode) issues.push('Place of supply missing');
   doc.lines.forEach((l, i) => { if (!l.hsn) issues.push(`Line ${i + 1}: HSN/SAC missing`); });
   if (doc.totals.total <= 0) issues.push('Total must be positive');
   if (doc.statutory?.eInvoiceStatus === 'Accepted') issues.push('IRN already generated');
@@ -1162,7 +1321,8 @@ export function submitEInvoice(collection: string, docId: string, opts: { forceF
   const irn = sha(doc.number + doc.date);
   const ackNo = '2324' + String(Math.floor(Math.random() * 1e11)).padStart(11, '0');
   const errMsg = 'Buyer GSTIN is inactive on the GST portal';
-  db.insert(C.integrationLogs, { provider: 'IRP', action: 'GenerateIRN', objectType: doc.docType, objectId: doc.id, objectNumber: doc.number, requestFingerprint: sha(JSON.stringify(doc.totals)), idempotencyKey: idem, request: { DocNo: doc.number, DocDt: doc.date, SellerGstin: db.find<Branch>(C.branches, doc.branchId)?.gstin, BuyerGstin: doc.partySnapshot?.gstin, TotInvVal: doc.totals.total }, response: fail ? { ErrorCode: '2172', ErrorMessage: errMsg } : { Irn: irn, AckNo: ackNo, AckDt: now, Status: 'ACT' }, status: fail ? 'Rejected' : 'Accepted', providerRef: fail ? undefined : ackNo, errorCode: fail ? '2172' : undefined, errorMessage: fail ? errMsg : undefined, at: now, correlationId: doc.correlationId ?? correlationId(), companyId: doc.companyId });
+  const exp = doc.invoiceType === 'EXPWP' || doc.invoiceType === 'EXPWOP';
+  db.insert(C.integrationLogs, { provider: 'IRP', action: 'GenerateIRN', objectType: doc.docType, objectId: doc.id, objectNumber: doc.number, requestFingerprint: sha(JSON.stringify(doc.totals)), idempotencyKey: idem, request: { ...eInvoiceTransactionDetails(doc), DocNo: doc.number, DocDt: doc.date, SellerGstin: db.find<Branch>(C.branches, doc.branchId)?.gstin, BuyerGstin: exp ? 'URP' : doc.partySnapshot?.gstin, BuyerPos: exp ? '96' : doc.placeOfSupplyCode, TotInvVal: doc.totals.total }, response: fail ? { ErrorCode: '2172', ErrorMessage: errMsg } : { Irn: irn, AckNo: ackNo, AckDt: now, Status: 'ACT' }, status: fail ? 'Rejected' : 'Accepted', providerRef: fail ? undefined : ackNo, errorCode: fail ? '2172' : undefined, errorMessage: fail ? errMsg : undefined, at: now, correlationId: doc.correlationId ?? correlationId(), companyId: doc.companyId });
   const statutory = fail
     ? { ...(doc.statutory ?? {}), eInvoiceStatus: 'Rejected' as const, eInvoiceError: `2172 · ${errMsg}`, eInvoiceSubmittedAt: now }
     : { ...(doc.statutory ?? {}), irn, ackNo, ackDate: now, signedQr: 'QR:' + irn.slice(0, 24), eInvoiceStatus: 'Accepted' as const, eInvoiceError: undefined, eInvoiceSubmittedAt: now };
@@ -1201,7 +1361,7 @@ export function generateEwayBill(collection: string, docId: string, input: { veh
   const ewbNo = String(Math.floor(1e11 + Math.random() * 9e11));
   const validDays = Math.max(1, Math.ceil(input.distanceKm / 200));
   const validUpto = new Date(Date.now() + validDays * 86400000).toISOString();
-  db.insert(C.integrationLogs, { provider: 'EWB', action: 'GenerateEWB', objectType: doc.docType, objectId: doc.id, objectNumber: doc.number, requestFingerprint: sha(doc.number + 'ewb'), idempotencyKey: `ewb:${doc.id}`, request: { DocNo: doc.number, VehicleNo: input.vehicleNo, TransporterId: input.transporterId, Distance: input.distanceKm }, response: { EwbNo: ewbNo, EwbValidTill: validUpto }, status: 'Accepted', providerRef: ewbNo, at: now, correlationId: doc.correlationId ?? correlationId(), companyId: doc.companyId });
+  db.insert(C.integrationLogs, { provider: 'EWB', action: 'GenerateEWB', objectType: doc.docType, objectId: doc.id, objectNumber: doc.number, requestFingerprint: sha(doc.number + 'ewb'), idempotencyKey: `ewb:${doc.id}`, request: { DocNo: doc.number, VehicleNo: input.vehicleNo, TransporterId: input.transporterId, Distance: input.distanceKm, DispDtls: eInvoiceTransactionDetails(doc).DispDtls, ShipDtls: eInvoiceTransactionDetails(doc).ShipDtls }, response: { EwbNo: ewbNo, EwbValidTill: validUpto }, status: 'Accepted', providerRef: ewbNo, at: now, correlationId: doc.correlationId ?? correlationId(), companyId: doc.companyId });
   const out = db.update<DocHeader>(collection, doc.id, { statutory: { ...(doc.statutory ?? {}), ewbNo, ewbStatus: 'Generated', ewbValidUpto: validUpto, vehicleNo: input.vehicleNo, transporterId: input.transporterId, distanceKm: input.distanceKm } });
   audit({ action: 'ewaybill.generated', objectType: doc.docType, objectId: doc.id, objectNumber: doc.number, detail: `EWB ${ewbNo} · valid ${validDays} day(s)` });
   notify({ type: 'integration', title: `e-Way bill generated: ${doc.number}`, body: `EWB ${ewbNo}`, link: docLinkFor(collection, doc.id) });

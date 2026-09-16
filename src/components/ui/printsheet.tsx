@@ -4,10 +4,11 @@
 // under `.print-sheet[data-layout]`. A template with no layout fields renders
 // as Classic, i.e. exactly the pre-layout sheet.
 import type { CSSProperties, ReactNode } from 'react';
-import { db, C, useSession } from '../../store';
-import type { Address, Branch, Company, DocHeader, DocLine, DocumentTemplate } from '../../store';
+import { db, C, engine, useSession } from '../../store';
+import type { Address, Branch, Company, DocAddress, DocHeader, DocLine, DocumentTemplate } from '../../store';
 import { fmtMoney, fmtQty, amountInWords, fmtDate } from '../../lib/format';
 import { resolveTemplateStyle, templateVars, renderTemplateText, addressLine, type TemplateStyle } from '../../lib/templates';
+import { ladderRows } from './document';
 
 interface SheetCtx { doc: DocHeader; co?: Company; branch?: Branch; st: TemplateStyle; cur: string }
 type BankDetails = { bankName: string; accountNumber: string | number; ifsc: string };
@@ -19,7 +20,9 @@ export function PrintSheet({ doc, title, partyLabel = 'Billed to', extraHeader, 
   // An explicit template (editor draft, print-time override) wins over the document's stamped template.
   const tpl = template ?? db.find<DocumentTemplate>(C.templates, doc.templateId) ?? db.findBy<DocumentTemplate>(C.templates, (t) => t.docType === doc.docType && t.isDefault);
   const st = resolveTemplateStyle(tpl, co);
-  const bank: BankDetails | undefined = st.showBankDetails && co?.defaults.bankAccountId ? db.find<any>(C.accounts, co.defaults.bankAccountId)?.bankDetails : undefined;
+  // the document's own bank (switchable per invoice) wins over the company default
+  const bankAccountId = doc.bankAccountId ?? co?.defaults.bankAccountId;
+  const bank: BankDetails | undefined = st.showBankDetails && bankAccountId ? db.find<any>(C.accounts, bankAccountId)?.bankDetails : undefined;
   const words = amountInWords(doc.totals.total, doc.currency);
   const vars = templateVars({ doc, company: co, branchGstin: branch?.gstin, bank, words });
   const version = template ? template.templateVersion : doc.templateVersion ?? tpl?.templateVersion ?? 1;
@@ -87,7 +90,8 @@ function SheetHeader({ doc, co, branch, st, title, headerText, extraHeader }: Sh
           </>
         )}
         {doc.sourceNumber && <div style={layout === 'compact' ? { fontSize: 10 } : sub}>Ref {doc.sourceNumber}</div>}
-        {doc.reference && <div style={layout === 'compact' ? { fontSize: 10 } : sub}>Your ref {doc.reference}</div>}
+        {doc.reference && <div style={layout === 'compact' ? { fontSize: 10 } : sub}>{doc.docType === 'Sales Invoice' ? 'PO' : 'Your ref'} {doc.reference}{doc.poDate ? ` dated ${fmtDate(doc.poDate)}` : ''}</div>}
+        {doc.docType === 'Sales Invoice' && (doc.invoiceType && doc.invoiceType !== 'Regular' || doc.reverseCharge) && <div style={layout === 'compact' ? { fontSize: 10 } : sub}>{[doc.invoiceType && doc.invoiceType !== 'Regular' ? `Supply type ${engine.invoiceTypeInfo(doc.invoiceType).label} (${doc.invoiceType})` : '', `Reverse charge: ${doc.reverseCharge ? 'Yes' : 'No'}`].filter(Boolean).join(' · ')}</div>}
         {headerText && <div style={{ fontSize: 10, color: muted }}>{headerText}</div>}
         {extraHeader}
       </div>
@@ -102,14 +106,17 @@ function PartyGrid({ doc, st, partyLabel }: SheetCtx & { partyLabel: string }) {
     ? { fontSize: t.labelSize, textTransform: 'uppercase', letterSpacing: '.08em', color: '#6E6E71', marginBottom: 2 }
     : { fontWeight: 700, textTransform: 'uppercase', fontSize: t.labelSize, color: layout === 'modern' ? st.accent : undefined };
   const addr = (a?: Address) => (a ? `${a.line1}, ${a.city}, ${a.state} ${a.pin ?? ''}` : '');
+  const over = (a?: DocAddress) => (a ? [a.name, addr(a.address), a.gstin ? `GSTIN ${a.gstin}` : ''].filter(Boolean).join(' · ') : '');
+  const shipped = doc.shipTo ? over(doc.shipTo) : snap?.shippingAddress ? addr(snap.shippingAddress) : 'As billed';
   const pos = `${doc.placeOfSupply ?? snap?.state ?? '—'}${doc.placeOfSupplyCode ? ` (${doc.placeOfSupplyCode})` : ''}`;
   if (layout === 'compact') {
     const cell = (k: string, v: ReactNode) => <div><span style={{ ...label, marginRight: 4 }}>{k}:</span>{v}</div>;
     return (
       <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 1fr', gap: 8, marginBottom: 8, fontSize: 10 }}>
         {cell(partyLabel, <>{snap?.name ?? doc.partyName}{snap?.billingAddress ? `, ${addr(snap.billingAddress)}` : ''}{snap?.gstin ? ` · GSTIN ${snap.gstin}` : ''}</>)}
-        {cell('Shipped to', snap?.shippingAddress ? addr(snap.shippingAddress) : 'As billed')}
+        {cell('Shipped to', shipped)}
         {cell('Place of supply', <>{pos}{doc.paymentTerms ? ` · Terms ${doc.paymentTerms}` : ''}</>)}
+        {doc.dispatchFrom && cell('Dispatched from', over(doc.dispatchFrom))}
       </div>
     );
   }
@@ -128,7 +135,8 @@ function PartyGrid({ doc, st, partyLabel }: SheetCtx & { partyLabel: string }) {
         </div>
         <div>
           <div style={label}>Shipped to</div>
-          {snap?.shippingAddress ? <div>{addr(snap.shippingAddress)}</div> : <div>As billed</div>}
+          {doc.shipTo ? <><div>{doc.shipTo.name ?? snap?.name ?? doc.partyName}</div><div>{addr(doc.shipTo.address)}</div>{doc.shipTo.gstin && <div>GSTIN {doc.shipTo.gstin}</div>}</> : snap?.shippingAddress ? <div>{addr(snap.shippingAddress)}</div> : <div>As billed</div>}
+          {doc.dispatchFrom && <><div style={{ ...label, marginTop: 6 }}>Dispatched from</div><div>{[doc.dispatchFrom.name, addr(doc.dispatchFrom.address)].filter(Boolean).join(', ')}</div></>}
         </div>
         {layout !== 'minimal' && (
           <div>
@@ -180,7 +188,8 @@ function TotalsBlock({ doc, st, cur, words }: SheetCtx & { words: string }) {
     : layout === 'compact' ? { fontWeight: 700, borderTop: '1px solid #0A0A0A', marginTop: 3, paddingTop: 3, fontSize: 11 }
     : layout === 'minimal' ? { fontWeight: 300, borderTop: '1px solid #0A0A0A', marginTop: 8, paddingTop: 8, fontSize: 16 }
     : { fontWeight: 700, borderTop: '1px solid #0A0A0A', marginTop: 4, paddingTop: 4, fontSize: 13 };
-  const ladder = [['Subtotal', doc.totals.subtotal], ['Discount', -doc.totals.discount], ['Taxable', doc.totals.taxable], ...Object.entries(doc.totals.components), ['Charges', doc.totals.charges], ['TDS', -doc.totals.tds], ['Round-off', doc.totals.roundOff]].filter(([, v]) => v !== 0);
+  const ladder = ladderRows(doc.totals, { showChargeBreakup: doc.showChargeBreakup ?? st.showChargeBreakup }).map((r) => [r.label, r.value, r.muted] as const);
+  const rcm = doc.totals.rcmTax ? Object.entries(doc.totals.rcmComponents ?? {}) : [];
   return (
     <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: layout === 'compact' ? 8 : 12, gap: 24 }}>
       <div style={{ flex: 1 }}>
@@ -193,9 +202,13 @@ function TotalsBlock({ doc, st, cur, words }: SheetCtx & { words: string }) {
         {st.showTaxBreakup && doc.totals.breakup.length > 0 && (
           <table style={{ marginTop: 8, width: 'auto' }}>
             <thead><tr><th>Component</th><th>Rate</th><th>Taxable</th><th>Tax</th></tr></thead>
-            <tbody>{doc.totals.breakup.map((b, i) => <tr key={i}><td>{b.component}</td><td>{b.rate}%</td><td style={{ textAlign: 'right' }}>{fmtMoney(b.taxable, cur)}</td><td style={{ textAlign: 'right' }}>{fmtMoney(b.tax, cur)}</td></tr>)}</tbody>
+            <tbody>
+              {doc.totals.breakup.filter((b) => !((doc.showChargeBreakup ?? st.showChargeBreakup) && b.hsn === 'Charges')).map((b, i) => <tr key={i}><td>{b.component}{b.reverseCharge ? ' (RCM)' : ''}</td><td>{b.rate}%</td><td style={{ textAlign: 'right' }}>{fmtMoney(b.taxable, cur)}</td><td style={{ textAlign: 'right' }}>{fmtMoney(b.tax, cur)}</td></tr>)}
+              {(doc.showChargeBreakup ?? st.showChargeBreakup) && (doc.totals.chargeRows ?? []).map((c) => <tr key={c.id}><td>{c.name}{c.reverseCharge ? ' (RCM)' : ''}</td><td>{c.taxRate ? `${c.taxRate}%` : '—'}</td><td style={{ textAlign: 'right' }}>{fmtMoney(c.amount, cur)}</td><td style={{ textAlign: 'right' }}>{fmtMoney(c.tax, cur)}</td></tr>)}
+            </tbody>
           </table>
         )}
+        {doc.reverseCharge || rcm.length > 0 ? <div style={{ marginTop: 6, fontSize: 10, fontWeight: 700 }}>Tax payable on reverse charge basis: {rcm.length ? rcm.map(([k, v]) => `${k} ${fmtMoney(v, cur)}`).join(' · ') + ` — total ${fmtMoney(doc.totals.rcmTax ?? 0, cur)} payable by the recipient` : 'Yes'}</div> : null}
         {doc.statutory?.irn && (
           <div style={{ marginTop: 8, border: '1px solid #DADCE0', padding: 8 }}>
             <div style={{ fontWeight: 700, fontSize: 10 }}>e-INVOICE</div>
@@ -207,8 +220,8 @@ function TotalsBlock({ doc, st, cur, words }: SheetCtx & { words: string }) {
         {doc.statutory?.ewbNo && <div style={{ fontSize: 10, marginTop: 4 }}>e-Way bill {doc.statutory.ewbNo} · valid until {fmtDate(doc.statutory.ewbValidUpto)}</div>}
       </div>
       <div style={{ width: t.ladderWidth, fontSize: layout === 'compact' ? 10 : undefined }}>
-        {ladder.map(([k, v]) => (
-          <div key={String(k)} style={{ display: 'flex', justifyContent: 'space-between', ...rowPad }}><span>{k}</span><span>{fmtMoney(v as number, cur)}</span></div>
+        {ladder.map(([k, v, muted]) => (
+          <div key={String(k)} style={{ display: 'flex', justifyContent: 'space-between', ...rowPad, ...(muted ? { color: '#5F6368', paddingLeft: 8 } : {}) }}><span>{k}</span><span>{fmtMoney(v as number, cur)}</span></div>
         ))}
         <div style={{ display: 'flex', justifyContent: 'space-between', ...totalRow }}><span>Total</span><span>{fmtMoney(doc.totals.total, cur)}</span></div>
       </div>
@@ -218,12 +231,17 @@ function TotalsBlock({ doc, st, cur, words }: SheetCtx & { words: string }) {
 
 function SheetFooter({ doc, co, st, bank, declaration, footer, code, version }: SheetCtx & { bank?: BankDetails; declaration: string; footer: string; code?: string; version: number }) {
   const { layout, t } = st;
+  // statutory declaration for zero-rated supplies without payment of IGST (LUT / bond)
+  const it = engine.invoiceTypeInfo(doc.invoiceType);
+  const lutNo = co?.defaults.tax?.lutNumber;
+  const lut = doc.docType === 'Sales Invoice' && it.zeroRated ? `Supply meant for ${it.value === 'SEZWOP' ? 'SEZ' : 'export'} under bond or Letter of Undertaking without payment of integrated tax${lutNo ? ` · LUT No. ${lutNo}` : ''}` : doc.docType === 'Sales Invoice' && (it.value === 'SEZWP' || it.value === 'EXPWP') ? `Supply meant for ${it.value === 'SEZWP' ? 'SEZ' : 'export'} on payment of integrated tax` : '';
   const rule = layout === 'modern' ? `1px solid ${st.accent}` : layout === 'minimal' ? 'none' : '1px solid #DADCE0';
   return (
     <>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: layout === 'compact' ? 16 : 24, borderTop: rule, paddingTop: layout === 'minimal' ? 0 : 12, fontSize: layout === 'compact' ? 9 : 10, color: layout === 'minimal' ? '#5F6368' : undefined }}>
         <div style={{ maxWidth: 400 }}>
-          {bank && <div>Bank: {bank.bankName} · A/c •••• {String(bank.accountNumber).slice(-4)} · IFSC {bank.ifsc}</div>}
+          {bank && <div>Bank: {bank.bankName} · A/c {String(bank.accountNumber)} · IFSC {bank.ifsc}{(bank as any).branch ? ` · ${(bank as any).branch}` : ''}</div>}
+          {lut && <div style={{ marginTop: 4, fontWeight: 700 }}>{lut}</div>}
           {declaration && <div style={{ marginTop: 4 }}>{declaration}</div>}
           {doc.terms && <div style={{ marginTop: 4 }}>{doc.terms}</div>}
           {doc.notes && <div style={{ marginTop: 4 }}>{doc.notes}</div>}

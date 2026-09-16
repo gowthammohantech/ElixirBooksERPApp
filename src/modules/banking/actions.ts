@@ -58,6 +58,17 @@ export function saveBankAccount(input: BankAccountInput): Account {
   return out;
 }
 
+/** Make a bank account the company default — printed on invoices unless the invoice or voucher type picks another (FR-SAL: default bank). */
+export function setDefaultBankAccount(accountId: string): Company {
+  const c = engine.ctx();
+  const acc = db.find<Account>(C.accounts, accountId);
+  if (!acc || !(acc.isBank || acc.controlType === 'Bank')) throw new ValidationError('Choose a bank account', 'VALIDATION');
+  if (!c.company) throw new ValidationError('No company in scope', 'NOT_FOUND');
+  const out = db.update<Company>(C.companies, c.company.id, { defaults: { ...c.company.defaults, bankAccountId: acc.id } });
+  engine.audit({ action: 'bank_account.set_default', objectType: 'Account', objectId: acc.id, objectNumber: acc.code, detail: `${acc.name} is now the default bank on invoices` });
+  return out;
+}
+
 // ── Vouchers (FR-BNK-002) ──────────────────────────────────────────────────
 
 export function newVoucher(type: VoucherType = 'Payment', prefill: Partial<BankVoucher> = {}): BankVoucher {

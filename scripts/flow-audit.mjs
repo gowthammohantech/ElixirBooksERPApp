@@ -7,7 +7,16 @@ const base = process.argv[2] ?? 'http://localhost:8443';
 let tearingDown = false;
 process.on('unhandledRejection', (e) => { if (tearingDown && String(e).includes('TargetClosedError')) return; console.error(e); process.exit(1); });
 
-const browser = await chromium.launch({ channel: 'msedge', headless: true });
+async function launch() {
+  try { return await chromium.launch({ channel: 'msedge', headless: true }); }
+  catch {
+    const { readdirSync } = await import('node:fs');
+    const root = `${process.env.LOCALAPPDATA ?? process.env.HOME + '/AppData/Local'}/ms-playwright`;
+    const dir = readdirSync(root).filter((d) => d.startsWith('chromium_headless_shell-')).sort().pop();
+    return chromium.launch({ headless: true, executablePath: `${root}/${dir}/chrome-headless-shell-win64/chrome-headless-shell.exe` });
+  }
+}
+const browser = await launch();
 const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
 const pageErrors = [];
 page.on('pageerror', (e) => pageErrors.push(String(e?.message ?? e)));

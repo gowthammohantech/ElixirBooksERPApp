@@ -409,8 +409,7 @@ export function validateGrn(g: Grn): string[] {
     if (l.remainingQty !== undefined && l.receivedQty > l.remainingQty * (1 + s.overReceiptTolerancePct / 100) + 0.0005) errs.push(`Line ${i + 1}: exceeds remaining ${l.remainingQty} (+${s.overReceiptTolerancePct}% tolerance)`);
     if (l.rejectedQty > 0 && !l.disposition) errs.push(`Line ${i + 1}: choose a disposition for rejected quantity`);
     if (item?.isStock && !l.warehouseId) errs.push(`Line ${i + 1}: warehouse is required`);
-    if (item?.tracking === 'Batch' && !l.batch && l.acceptedQty > 0) errs.push(`Line ${i + 1}: batch number is required for ${item.name}`);
-    if (item?.tracking === 'Serial' && (l.serials?.length ?? 0) !== Math.round(l.acceptedQty)) errs.push(`Line ${i + 1}: ${Math.round(l.acceptedQty)} serial numbers required`);
+    if (l.acceptedQty > 0 || item?.tracking === 'Serial') engine.validateLineStock(l, item, l.acceptedQty, { direction: 'in' }).forEach((m) => errs.push(`Line ${i + 1}: ${m}`));
   });
   return errs;
 }
@@ -441,8 +440,9 @@ export function postGrn(input: Grn): Grn {
       // net unit cost after line discount (l.taxable is computed on acceptedQty) — stock ledger and accrual must agree to the rupee (FR-INV-008)
       const unitCost = l.acceptedQty > 0 ? l.taxable / l.acceptedQty : l.rate * (1 - (l.discountPct || 0) / 100);
       if (item.isStock && item.type !== 'Service') {
-        if (l.acceptedQty > 0) engine.moveStock({ date: g.date, itemId: item.id, warehouseId: l.warehouseId!, qty: l.acceptedQty, uom: l.uom, rate: r2(unitCost * g.rate), type: 'GRN', sourceType: 'GRN', sourceId: saved.id, sourceNumber: number, batch: l.batch, serials: l.serials, bin: l.bin, expiryDate: l.expiryDate });
-        if (l.heldQty > 0) engine.moveStock({ date: g.date, itemId: item.id, warehouseId: l.warehouseId!, qty: l.heldQty, uom: l.uom, rate: r2(unitCost * g.rate), type: 'GRN', sourceType: 'GRN', sourceId: saved.id, sourceNumber: number, batch: l.batch, bin: 'QC-HOLD', expiryDate: l.expiryDate });
+        // one receipt movement per batch / lot / serial slice (multi-lot receipt); held stock rides on the first lot
+        if (l.acceptedQty > 0) engine.lineStockRows(l, l.acceptedQty).forEach((r) => engine.moveStock({ date: g.date, itemId: item.id, warehouseId: l.warehouseId!, qty: r.qty, uom: l.uom, rate: r2(unitCost * g.rate), type: 'GRN', sourceType: 'GRN', sourceId: saved.id, sourceNumber: number, batch: r.batch, serials: r.serials, bin: l.bin, expiryDate: r.expiryDate ?? l.expiryDate }));
+        if (l.heldQty > 0) engine.moveStock({ date: g.date, itemId: item.id, warehouseId: l.warehouseId!, qty: l.heldQty, uom: l.uom, rate: r2(unitCost * g.rate), type: 'GRN', sourceType: 'GRN', sourceId: saved.id, sourceNumber: number, batch: l.batch ?? l.breakup?.[0]?.batch, bin: 'QC-HOLD', expiryDate: l.expiryDate ?? l.breakup?.[0]?.expiryDate });
       }
       if (l.acceptedQty > 0) {
         const value = r2(l.taxable);

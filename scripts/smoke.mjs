@@ -39,7 +39,16 @@ const routes = extra.length ? extra : [
   'admin/jobs', 'admin/notifications', 'admin/data', 'platform', 'platform/plans', 'platform/tenants', 'platform/usage', 'platform/audit'
 ];
 
-const browser = await chromium.launch({ channel: 'msedge', headless: true });
+async function launch() {
+  try { return await chromium.launch({ channel: 'msedge', headless: true }); }
+  catch {
+    const { readdirSync } = await import('node:fs');
+    const root = `${process.env.LOCALAPPDATA ?? process.env.HOME + '/AppData/Local'}/ms-playwright`;
+    const dir = readdirSync(root).filter((d) => d.startsWith('chromium_headless_shell-')).sort().pop();
+    return chromium.launch({ headless: true, executablePath: `${root}/${dir}/chrome-headless-shell-win64/chrome-headless-shell.exe` });
+  }
+}
+const browser = await launch();
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 const errors = [];
 page.on('pageerror', (e) => errors.push({ route: page.url(), type: 'pageerror', msg: String(e?.message ?? e) }));

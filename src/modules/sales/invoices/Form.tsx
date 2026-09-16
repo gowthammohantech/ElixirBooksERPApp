@@ -2,11 +2,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { db, C, engine, nav, useSession } from '../../../store';
 import type { Customer, DocHeader, DocumentTemplate, Item } from '../../../store';
-import { PageHeader, Button, Banner, Card, DateField, TextField, SelectField, TextArea, NumberField, CheckboxField, LineItemGrid, TotalsLadder, TaxBreakup, ConfirmDialog, Modal, AttachmentsPanel, useToast, Badge, Explain, PeriodBanner } from '../../../components/ui';
+import { PageHeader, Button, Banner, Card, DateField, SelectField, TextArea, CheckboxField, LineItemGrid, TotalsLadder, TaxBreakup, ConfirmDialog, Modal, AttachmentsPanel, useToast, Badge, Explain, PeriodBanner } from '../../../components/ui';
 import { fmtDate, fmtMoney, fmtQty, stateNameOf } from '../../../lib/format';
 import type { SalesInvoice, SalesOrder, Delivery } from '../types';
-import { useDocDraft, CustomerField, PlaceOfSupplyField, CurrencyRateFields, DimensionsFields, ChargesEditor, TdsField, FormFooter, ErrorSummary, DuplicateReferenceNote, usePaymentTermOptions, useSalespersonOptions, usePriceListOptions, useSalesSettings, useTemplateOptions } from '../common';
-import { newInvoice, saveInvoice, submitInvoice, postInvoice, invoiceNeedsWorkflow, validateSalesDoc, creditCheckFor, stockIssuesFor, invoiceJournalLines, invoiceFromSource, ordersEligibleForInvoice, deliveriesEligibleForInvoice, duplicateReference, recompute } from '../actions';
+import { useDocDraft, CustomerField, PlaceOfSupplyField, CurrencyRateFields, DimensionsFields, ChargesEditor, TdsField, FormFooter, ErrorSummary, usePaymentTermOptions, useSalespersonOptions, usePriceListOptions, useSalesSettings, useTemplateOptions, VoucherTypeField, InvoiceTypeField, ReverseChargeField, BankAccountField, PoFields, DocDiscountField, AddressOverrideFields } from '../common';
+import { newInvoice, saveInvoice, submitInvoice, postInvoice, invoiceNeedsWorkflow, validateSalesDoc, creditCheckFor, stockIssuesFor, invoiceJournalLines, invoiceFromSource, ordersEligibleForInvoice, deliveriesEligibleForInvoice, duplicateReference, recompute, applyVoucherType, invoiceTitle } from '../actions';
 
 export default function InvoiceForm({ id, sourceOrderId, sourceDeliveryId }: { id?: string; sourceOrderId?: string; sourceDeliveryId?: string }) {
   const s = useSession();
@@ -50,7 +50,8 @@ export default function InvoiceForm({ id, sourceOrderId, sourceDeliveryId }: { i
     setSourcePicker(null);
   };
 
-  const setHeaderDiscount = (pct: number) => set({ headerDiscountPct: pct, lines: doc.lines.map((l) => ({ ...l, discountPct: pct, discountAmt: 0 })) });
+  const previewNo = engine.previewNumber('Sales Invoice', { date: doc.date, branchId: doc.branchId, voucherTypeId: doc.voucherTypeId });
+  const itInfo = engine.invoiceTypeInfo(doc.invoiceType);
   const changeDate = (date: string) => set({ date, dueDate: engine.dueDateFor(date, doc.paymentTerms), period: date.slice(0, 7) });
   const changeTerms = (t: string) => set({ paymentTerms: t, dueDate: engine.dueDateFor(doc.date, t) });
 
@@ -79,7 +80,7 @@ export default function InvoiceForm({ id, sourceOrderId, sourceDeliveryId }: { i
   const base = s.currency;
   return (
     <div className="page">
-      <PageHeader back={{ label: 'Sales invoices', path: 'sales/invoices' }} title={<span style={{ display: 'flex', gap: 10, alignItems: 'center' }}>{id ? doc.number : 'New sales invoice'} <Badge status={doc.status} /></span>} subtitle={<>{doc.number.includes('DRAFT') ? `Will be numbered ${engine.previewNumber('Sales Invoice', { date: doc.date, branchId: doc.branchId })} on post` : doc.number} · {s.branch?.name} · FY {s.state.fy}{doc.sourceNumber ? ` · from ${doc.sourceType} ${doc.sourceNumber}` : ''}</>} actions={editable && !doc.sourceId && doc.lines.length === 0 ? <><Button variant="secondary" onClick={() => setSourcePicker('order')}>From order</Button><Button variant="secondary" onClick={() => setSourcePicker('delivery')}>From delivery</Button></> : doc.sourceId ? <Button variant="ghost" onClick={() => set({ sourceId: undefined, sourceType: undefined, sourceNumber: undefined, deliveryIds: undefined, lines: [] })}>Detach source</Button> : undefined} />
+      <PageHeader back={{ label: 'Sales invoices', path: 'sales/invoices' }} title={<span style={{ display: 'flex', gap: 10, alignItems: 'center' }}>{id ? doc.number : `New ${invoiceTitle(doc).toLowerCase()}`} <Badge status={doc.status} />{doc.reverseCharge && <Badge status="Pending">RCM</Badge>}{itInfo.value !== 'Regular' && <Badge status="Draft">{itInfo.short}</Badge>}</span>} subtitle={<>{doc.number.includes('DRAFT') ? `Will be numbered ${previewNo} on post` : doc.number} · {s.branch?.name} · FY {s.state.fy}{doc.sourceNumber ? ` · from ${doc.sourceType} ${doc.sourceNumber}` : ''}</>} actions={editable && !doc.sourceId && doc.lines.length === 0 ? <><Button variant="secondary" onClick={() => setSourcePicker('order')}>From order</Button><Button variant="secondary" onClick={() => setSourcePicker('delivery')}>From delivery</Button></> : doc.sourceId ? <Button variant="ghost" onClick={() => set({ sourceId: undefined, sourceType: undefined, sourceNumber: undefined, deliveryIds: undefined, lines: [] })}>Detach source</Button> : undefined} />
       {draft.conflict && <Banner tone="danger" action={<Button variant="link" onClick={draft.reload}>Reload</Button>}>Someone else changed this draft — reload to see their changes.</Banner>}
       <PeriodBanner date={doc.date} />
       {credit?.message && <Banner tone={credit.ok ? 'warning' : 'danger'}>{credit.message}{credit.needsApproval ? ' — submitting will route to approval as a credit exception.' : ''} <span style={{ color: 'var(--ink-3)' }}>Exposure {fmtMoney(credit.exposure)} · limit {fmtMoney(credit.limit)}</span></Banner>}
@@ -95,13 +96,24 @@ export default function InvoiceForm({ id, sourceOrderId, sourceDeliveryId }: { i
           <DateField label={<span>Due date <Explain title="How the due date was derived" rows={[{ k: 'Invoice date', v: fmtDate(doc.date) }, { k: 'Terms', v: doc.paymentTerms ?? '—' }, { k: 'Due', v: fmtDate(doc.dueDate) }]} note="Override is permitted; the terms stay on the document." /></span>} value={doc.dueDate} onChange={(v) => set({ dueDate: v })} />
           <SelectField label="Payment terms" value={doc.paymentTerms ?? ''} onChange={changeTerms} options={termOpts} />
           <SelectField label="Salesperson" value={doc.salespersonId ?? ''} onChange={(v) => set({ salespersonId: v || undefined })} options={spOpts} placeholder="—" />
-          <div>
-            <TextField label="Customer reference / PO" value={doc.reference ?? ''} onChange={(v) => set({ reference: v })} placeholder="PO-ARLENE-0042" />
-            <DuplicateReferenceNote inv={doc} />
-          </div>
+          <PoFields doc={doc} onChange={(p) => set(p as Partial<SalesInvoice>)} />
           <SelectField label="Print template" value={doc.templateId ?? ''} onChange={(v) => set({ templateId: v || undefined, templateVersion: db.find<DocumentTemplate>(C.templates, v || undefined)?.templateVersion })} options={tplOpts} placeholder="Company default" help="Layout used for the PDF · can also be switched at print time" />
           <CurrencyRateFields doc={doc} onChange={(p) => set(p as Partial<SalesInvoice>)} disabled={!!cust && cust.currency !== doc.currency && false} />
         </div>
+      </Card>
+
+      <Card title="GST & numbering">
+        <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 1fr', gap: 16, alignItems: 'start' }}>
+          <InvoiceTypeField doc={doc} onChange={(t) => set({ invoiceType: t })} />
+          <ReverseChargeField doc={doc} onChange={(v) => set({ reverseCharge: v || undefined })} />
+          <VoucherTypeField doc={doc} onChange={(vid) => set((d) => applyVoucherType(d, vid))} />
+          <BankAccountField doc={doc} onChange={(v) => set({ bankAccountId: v })} />
+        </div>
+        {itInfo.zeroRated && <div style={{ fontSize: 12, color: 'var(--ink-3)', marginTop: 8 }}>Supply meant for {itInfo.value.startsWith('SEZ') ? 'SEZ' : 'export'} under bond or Letter of Undertaking without payment of integrated tax — the LUT number prints in the declaration.</div>}
+      </Card>
+
+      <Card title="Addresses" padding={16}>
+        <AddressOverrideFields doc={doc} onChange={(p) => set(p as Partial<SalesInvoice>)} />
       </Card>
 
       <section>
@@ -109,14 +121,14 @@ export default function InvoiceForm({ id, sourceOrderId, sourceDeliveryId }: { i
           <div className="section-title" style={{ marginBottom: 0 }}>Lines {doc.sourceNumber && <span style={{ fontSize: 12, color: 'var(--ink-3)', fontWeight: 400 }}>· from {doc.sourceType} {doc.sourceNumber} · eligibility capped at remaining +{settings.salesOverInvoiceTolerancePct}%</span>}</div>
           <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
             {direct && <SelectField size="sm" label={undefined} value={doc.warehouseId ?? ''} onChange={(v) => set({ warehouseId: v || undefined, lines: doc.lines.map((l) => ({ ...l, warehouseId: v || l.warehouseId })) })} options={db.get<any>(C.warehouses).filter((w) => w.status === 'Active' && w.type === 'Standard').map((w) => ({ value: w.id, label: `Stock from ${w.name}` }))} style={{ width: 220 }} />}
-            <NumberField size="sm" value={doc.headerDiscountPct ?? 0} onChange={setHeaderDiscount} suffix="% off" min={0} max={100} style={{ width: 130 }} />
+            <DocDiscountField doc={doc} onChange={(d) => set({ docDiscount: d })} />
           </div>
         </div>
-        <LineItemGrid lines={doc.lines} onChange={setLines} partyId={doc.partyId} priceListId={doc.priceListId} currency={doc.currency} showWarehouse={direct && !!s.company?.defaults.directInvoiceStock} showBatch={direct && !!s.company?.defaults.directInvoiceStock} sourceLinked={!!doc.sourceId} totals={doc.totals} itemFilter={(i: Item) => i.status === 'Active'} />
+        <LineItemGrid lines={doc.lines} onChange={setLines} partyId={doc.partyId} priceListId={doc.priceListId} currency={doc.currency} showWarehouse={direct && !!s.company?.defaults.directInvoiceStock} showBatch={direct && !!s.company?.defaults.directInvoiceStock} stockDirection="out" showDimensions headerDimensions={doc.dimensions} sourceLinked={!!doc.sourceId} totals={doc.totals} itemFilter={(i: Item) => i.status === 'Active'} />
         {issues.length > 0 && <div style={{ fontSize: 12, color: 'var(--ink-3)', marginTop: 6 }}>Direct stock invoicing is on: {issues.map((p) => `${fmtQty(p.qty, p.item.baseUom)} ${p.item.name}`).join(', ')} will be issued from stock on post.</div>}
       </section>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: 24, alignItems: 'start' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 380px', gap: 24, alignItems: 'start' }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
           <Card title="Charges" padding={16}><ChargesEditor charges={doc.charges} onChange={(c) => set({ charges: c })} currency={doc.currency} /></Card>
           <Card title="Withholding & rounding" padding={16}>
@@ -142,8 +154,8 @@ export default function InvoiceForm({ id, sourceOrderId, sourceDeliveryId }: { i
         </div>
         <div style={{ position: 'sticky', top: 16 }}>
           <div className="section-title">Totals</div>
-          <TotalsLadder totals={doc.totals} currency={doc.currency} baseCurrency={base} rate={doc.rate} showPaid={false} />
-          <div style={{ marginTop: 16 }}><div className="section-title">Tax breakup</div><TaxBreakup totals={doc.totals} currency={doc.currency} /></div>
+          <TotalsLadder totals={doc.totals} currency={doc.currency} baseCurrency={base} rate={doc.rate} showPaid={false} showChargeBreakup={doc.showChargeBreakup} />
+          <div style={{ marginTop: 16 }}><div className="section-title">Tax breakup</div><TaxBreakup totals={doc.totals} currency={doc.currency} showChargeBreakup={doc.showChargeBreakup} onToggleChargeBreakup={(v) => set({ showChargeBreakup: v || undefined })} /></div>
         </div>
       </div>
 
@@ -158,12 +170,13 @@ export default function InvoiceForm({ id, sourceOrderId, sourceDeliveryId }: { i
 
       <ConfirmDialog open={confirmPost} onClose={() => setConfirmPost(false)} title={`Post invoice for ${doc.partyName ?? 'customer'}?`} statement="Posting allocates the number, creates the receivable and journal and issues stock. It cannot be undone — reverse instead." confirmLabel="Post invoice" cancelLabel="Keep as draft" disabled={busy}
         consequences={[
-          { engine: 'Numbering', text: `Number ${engine.previewNumber('Sales Invoice', { date: doc.date, branchId: doc.branchId })} will be allocated` },
-          { engine: 'Journal', text: `Dr AR ${fmtMoney(doc.totals.total, doc.currency)} · Cr Sales ${fmtMoney(doc.totals.taxable, doc.currency)} · Cr Output tax ${fmtMoney(doc.totals.tax, doc.currency)}${doc.totals.tds ? ` · Dr TDS receivable ${fmtMoney(doc.totals.tds, doc.currency)}` : ''}` },
+          { engine: 'Numbering', text: `Number ${previewNo} will be allocated` },
+          { engine: 'Journal', text: `Dr AR ${fmtMoney(doc.totals.total, doc.currency)} · Cr Sales ${fmtMoney(doc.totals.taxable, doc.currency)} · Cr Output tax ${fmtMoney(doc.totals.tax, doc.currency)}${doc.totals.tds ? ` · Dr TDS receivable ${fmtMoney(doc.totals.tds, doc.currency)}` : ''}${doc.totals.docDiscountAfterTax && doc.totals.docDiscount ? ` · Dr Discount allowed ${fmtMoney(doc.totals.docDiscount, doc.currency)}` : ''}` },
+          ...(doc.totals.rcmTax ? [{ engine: 'Tax', text: `Reverse charge: ${fmtMoney(doc.totals.rcmTax, doc.currency)} shown on the invoice, payable by the recipient — not posted`, tone: 'warning' as const }] : []),
           ...(issues.length ? [{ engine: 'Stock', text: `${issues.length} line(s) issued: ${issues.map((p) => `${fmtQty(p.qty)} ${p.item.name}`).join(', ')}` }] : []),
           { engine: 'Open items', text: `Receivable ${fmtMoney(doc.totals.total, doc.currency)} due ${fmtDate(doc.dueDate)}` },
           { engine: 'Tax', text: Object.entries(doc.totals.components).map(([k, v]) => `${k} ${fmtMoney(v, doc.currency)}`).join(' · ') || 'No tax' },
-          ...(doc.partySnapshot?.gstin ? [{ engine: 'Statutory', text: 'e-Invoice will be Pending — generate the IRN from the document page' }] : []),
+          ...(engine.eInvoiceApplicable(doc) ? [{ engine: 'Statutory', text: `e-Invoice will be Pending (supply type ${engine.eInvoiceTransactionDetails(doc).SupTyp}) — generate the IRN from the document page` }] : []),
           ...(credit?.message ? [{ engine: 'Workflow', text: credit.message, tone: 'warning' as const }] : []),
         ]}
         onConfirm={() => post()} />

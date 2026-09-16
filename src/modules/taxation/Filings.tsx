@@ -2,7 +2,7 @@
 import { useState } from 'react';
 import { C, db, engine, nav, useSession, useCollection } from '../../store';
 import type { Company } from '../../store';
-import { RegisterPage, Badge, Button, Card, MoneyField, NumberField, TextField, Toggle, useToast, Banner, KV, type Column } from '../../components/ui';
+import { RegisterPage, Badge, Button, Card, MoneyField, NumberField, TextField, DateField, Toggle, useToast, Banner, KV, type Column } from '../../components/ui';
 import { fmtMoney, fmtDate, fmtDateTime, fmtPeriod, downloadText } from '../../lib/format';
 import { taxSettings, DEFAULT_TAX_SETTINGS } from './derive';
 import type { StatutoryReturn } from './types';
@@ -57,6 +57,12 @@ export function TaxSettingsPage() {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             <MoneyField label="e-Way bill threshold (consignment value)" value={f.eWayBillThreshold} onChange={(v) => setF({ ...f, eWayBillThreshold: v })} help="Statutory ₹50,000 — change only for intra-state exemptions" />
             <div className="grid-2"><NumberField label="GSTR-1 due day" value={f.gstr1DueDay} onChange={(v) => setF({ ...f, gstr1DueDay: v })} decimals={0} min={1} max={28} /><NumberField label="GSTR-3B due day" value={f.gstr3bDueDay} onChange={(v) => setF({ ...f, gstr3bDueDay: v })} decimals={0} min={1} max={28} /></div>
+          </div>
+        </Card>
+        <Card title="Letter of Undertaking (zero-rated supplies)">
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <TextField label="LUT / bond number" value={f.lutNumber ?? ''} onChange={(v) => setF({ ...f, lutNumber: v.trim().toUpperCase() || undefined })} placeholder="AD270326000123X" uppercase help="Required for 'SEZ without payment of tax' and 'Export without payment of tax' invoices; printed in the invoice declaration" />
+            <div className="grid-2"><DateField label="Valid from" value={f.lutValidFrom} onChange={(v) => setF({ ...f, lutValidFrom: v || undefined })} /><DateField label="Valid to" value={f.lutValidTo} onChange={(v) => setF({ ...f, lutValidTo: v || undefined })} help="An LUT covers one financial year — renew before it lapses" /></div>
           </div>
         </Card>
         <Card title="Registrations (from company profile)">

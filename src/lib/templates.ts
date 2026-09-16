@@ -57,6 +57,7 @@ export interface TemplateStyle {
   showDiscount: boolean;
   showTaxColumn: boolean;
   showTaxBreakup: boolean;
+  showChargeBreakup: boolean;
   showAmountInWords: boolean;
   showBankDetails: boolean;
   showSignatory: boolean;
@@ -83,6 +84,7 @@ export function resolveTemplateStyle(tpl?: Partial<DocumentTemplate> | null, com
     showDiscount: tpl?.showDiscount ?? preset.showDiscount,
     showTaxColumn: tpl?.showTaxColumn ?? preset.showTaxColumn,
     showTaxBreakup: tpl?.showTaxBreakup ?? preset.showTaxBreakup,
+    showChargeBreakup: tpl?.showChargeBreakup ?? false,
     showAmountInWords: tpl?.showAmountInWords ?? preset.showAmountInWords,
     showBankDetails: tpl?.showBankDetails ?? false,
     showSignatory: tpl?.showSignatory ?? true,
@@ -107,8 +109,8 @@ export function styleFingerprint(tpl: Partial<DocumentTemplate>, company?: Parti
 
 export const TEMPLATE_VARIABLES: { group: string; vars: string[] }[] = [
   { group: 'Company', vars: ['company.legalName', 'company.tradeName', 'company.gstin', 'company.pan', 'company.address', 'company.email', 'company.phone'] },
-  { group: 'Document', vars: ['doc.number', 'doc.date', 'doc.dueDate', 'doc.reference', 'doc.validUntil', 'doc.paymentTerms', 'doc.placeOfSupply'] },
-  { group: 'Party', vars: ['party.name', 'party.gstin', 'party.pan', 'party.billingAddress', 'party.shippingAddress', 'party.contact'] },
+  { group: 'Document', vars: ['doc.number', 'doc.date', 'doc.dueDate', 'doc.reference', 'doc.poDate', 'doc.invoiceType', 'doc.reverseCharge', 'doc.validUntil', 'doc.paymentTerms', 'doc.placeOfSupply', 'doc.lut'] },
+  { group: 'Party', vars: ['party.name', 'party.gstin', 'party.pan', 'party.billingAddress', 'party.shippingAddress', 'party.dispatchAddress', 'party.contact'] },
   { group: 'Totals', vars: ['totals.subtotal', 'totals.tax', 'totals.total', 'totals.words', 'totals.due'] },
   { group: 'Statutory', vars: ['statutory.irn', 'statutory.ackNo', 'statutory.qr', 'statutory.ewbNo'] },
   { group: 'Bank', vars: ['bank.name', 'bank.accountMasked', 'bank.ifsc'] },
@@ -140,6 +142,10 @@ export function templateVars(input: { doc: DocHeader; company?: Company | null; 
     'doc.date': fmtDate(doc.date),
     'doc.dueDate': doc.dueDate ? fmtDate(doc.dueDate) : '',
     'doc.reference': doc.reference ?? '',
+    'doc.poDate': doc.poDate ? fmtDate(doc.poDate) : '',
+    'doc.invoiceType': doc.invoiceType ?? 'Regular',
+    'doc.reverseCharge': doc.reverseCharge ? 'Yes' : 'No',
+    'doc.lut': co?.defaults?.tax?.lutNumber ?? '',
     'doc.validUntil': doc.validUntil ? fmtDate(doc.validUntil) : '',
     'doc.paymentTerms': doc.paymentTerms ?? '',
     'doc.placeOfSupply': doc.placeOfSupply ?? snap?.state ?? '',
@@ -147,7 +153,8 @@ export function templateVars(input: { doc: DocHeader; company?: Company | null; 
     'party.gstin': snap?.gstin ?? '',
     'party.pan': snap?.pan ?? '',
     'party.billingAddress': addressLine(snap?.billingAddress),
-    'party.shippingAddress': addressLine(snap?.shippingAddress ?? snap?.billingAddress),
+    'party.shippingAddress': addressLine(doc.shipTo?.address ?? snap?.shippingAddress ?? snap?.billingAddress),
+    'party.dispatchAddress': addressLine(doc.dispatchFrom?.address ?? co?.address),
     'party.contact': snap?.contact ? [snap.contact.name, snap.contact.email, snap.contact.phone].filter(Boolean).join(' · ') : '',
     'totals.subtotal': fmtMoney(doc.totals.subtotal, cur),
     'totals.tax': fmtMoney(doc.totals.tax, cur),

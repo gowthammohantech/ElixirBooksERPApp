@@ -111,6 +111,8 @@ export interface CompanyDefaults {
   paymentTerms?: string;
   priceListId?: ID;
   templateId?: ID;
+  /** expense account for document-level discounts applied after tax; falls back to the sales account */
+  discountAllowedAccountId?: ID;
   allowNegativeStock: boolean;
   valuationMethod: 'AVCO' | 'FIFO' | 'Standard';
   matchingMode: '2-way' | '3-way' | '4-way';
@@ -143,6 +145,10 @@ export interface TaxSettings {
   provider: string;
   gstr1DueDay: number;
   gstr3bDueDay: number;
+  /** Letter of Undertaking for zero-rated supplies without payment of IGST (SEZWOP / EXPWOP) */
+  lutNumber?: string;
+  lutValidFrom?: string;
+  lutValidTo?: string;
 }
 
 /** Payroll module settings (FR-PAY-001..003) — stored on company.defaults.payroll */
@@ -537,6 +543,8 @@ export interface NumberSeries extends BaseRecord {
   allocation: 'On save' | 'On post';
   status: 'Active' | 'Inactive';
   voids: { number: string; reason: string; at: string; by: string }[];
+  /** series owned by a voucher type; series without one are the document type's default */
+  voucherTypeId?: ID;
 }
 
 export interface PaymentTerm extends BaseRecord {
@@ -604,12 +612,46 @@ export interface DocumentTemplate extends BaseRecord {
   showDiscount?: boolean;
   showTaxColumn?: boolean;
   showTaxBreakup?: boolean;
+  /** itemise freight / packing / insurance in the print totals (a document-level flag wins when set) */
+  showChargeBreakup?: boolean;
   showAmountInWords?: boolean;
   /** undefined ⇒ 'A4' */
   paperSize?: PaperSize;
 }
 
 // ── Documents (generic) ────────────────────────────────────────────────────
+
+/** One batch / lot / serial slice of a document line (receipt or issue). */
+export interface LineBreakup {
+  id: ID;
+  /** batch or lot number (the item's tracking decides whether it is required) */
+  batch?: string;
+  serials?: string[];
+  qty: number;
+  mfgDate?: string;
+  expiryDate?: string;
+}
+
+/**
+ * GST supply type of a sales invoice; the codes are the e-invoice `SupTyp` values.
+ * Regular → normal B2B/B2C · SEZWP / EXPWP → IGST charged · SEZWOP / EXPWOP → zero-rated under LUT/bond · DEXP → deemed export (taxed, refundable).
+ */
+export type InvoiceType = 'Regular' | 'SEZWP' | 'SEZWOP' | 'EXPWP' | 'EXPWOP' | 'DEXP';
+
+/** Document-level discount: a percentage or fixed amount, applied before tax (apportioned to lines) or after tax (reduces only the amount payable). */
+export interface DocDiscount {
+  mode: 'pct' | 'amt';
+  value: number;
+  /** stamped from the sales setting when the discount is entered so a later settings change never re-states a posted document */
+  afterTax?: boolean;
+}
+
+/** An address override printed on the invoice and sent to the e-invoice / e-way bill (ShipDtls / DispDtls). */
+export interface DocAddress {
+  name?: string;
+  gstin?: string;
+  address: Address;
+}
 
 export interface DocLine {
   id: ID;
@@ -638,6 +680,10 @@ export interface DocLine {
   warehouseId?: ID;
   batch?: string;
   serials?: string[];
+  /** multi batch / lot / serial split of this line; when present it wins over `batch` / `serials` (FR-INV: one line, many lots) */
+  breakup?: LineBreakup[];
+  /** share of a document-level "before tax" discount apportioned to this line — derived on every recompute, never entered */
+  docDiscountAmt?: number;
   dimensions?: Record<string, string>;
   sourceLineId?: ID;
   sourceDocId?: ID;
@@ -661,10 +707,24 @@ export interface TaxBreakupRow {
   hsn: string;
   taxable: number;
   tax: number;
+  /** tax shown for information only — payable by the recipient under reverse charge, not part of `totals.tax` */
+  reverseCharge?: boolean;
+}
+
+/** Per-charge line of the tax summary ("show breakup" of freight / packing / insurance). */
+export interface ChargeBreakupRow {
+  id: ID;
+  name: string;
+  amount: number;
+  taxRate: number;
+  tax: number;
+  components: Record<string, number>;
+  reverseCharge?: boolean;
 }
 
 export interface DocTotals {
   subtotal: number;
+  /** line-level discounts only; the document-level discount is reported separately in `docDiscount` */
   discount: number;
   taxable: number;
   tax: number;
@@ -680,6 +740,13 @@ export interface DocTotals {
   writtenOff: number;
   due: number;
   baseTotal: number;
+  /** document-level discount amount (before-tax: already netted into `taxable`; after-tax: deducted from `total`) */
+  docDiscount?: number;
+  docDiscountAfterTax?: boolean;
+  /** tax computed on reverse-charge lines/charges — shown on the invoice, payable by the recipient, never added to `total` */
+  rcmTax?: number;
+  rcmComponents?: Record<string, number>;
+  chargeRows?: ChargeBreakupRow[];
 }
 
 export interface PartySnapshot {
@@ -768,6 +835,42 @@ export interface DocHeader extends BaseRecord {
   revision?: number;
   validUntil?: string;
   charges?: { id: ID; name: string; amount: number; taxRateId?: ID; accountId?: ID }[];
+  /** GST supply type (sales invoices) — drives zero-rating / IGST and the e-invoice SupTyp */
+  invoiceType?: InvoiceType;
+  /** tax payable by the recipient: computed and shown, never added to the total (FR-TAX RCM) */
+  reverseCharge?: boolean;
+  /** voucher type that owns this document's numbering series and defaults */
+  voucherTypeId?: ID;
+  /** bank account printed on the document (defaults to the company default bank) */
+  bankAccountId?: ID;
+  /** customer PO date — `reference` carries the PO number */
+  poDate?: string;
+  /** ship-to override when goods go somewhere other than the customer's shipping address */
+  shipTo?: DocAddress;
+  /** dispatch-from override when goods leave from somewhere other than the branch address */
+  dispatchFrom?: DocAddress;
+  docDiscount?: DocDiscount;
+  /** itemise charges in the tax summary instead of one "Charges" line */
+  showChargeBreakup?: boolean;
+}
+
+/**
+ * Voucher type (FR-DOC-001 extension): several numbering series for one document type in a
+ * company or branch — e.g. domestic, export and service invoices — each with its own defaults.
+ */
+export interface VoucherType extends BaseRecord {
+  code: string;
+  name: string;
+  docType: string;
+  branchId?: ID;
+  /** printed document title, e.g. "Tax Invoice", "Export Invoice", "Bill of Supply" */
+  printTitle?: string;
+  invoiceType?: InvoiceType;
+  reverseCharge?: boolean;
+  templateId?: ID;
+  bankAccountId?: ID;
+  isDefault: boolean;
+  status: 'Active' | 'Inactive';
 }
 
 // ── Accounting ─────────────────────────────────────────────────────────────

@@ -10,7 +10,7 @@ export type Row = BaseRecord & Record<string, any>;
 export type DB = Record<string, Row[]>;
 
 const STORAGE_KEY = 'elixir-books-db';
-export const SEED_VERSION = 'v6';
+export const SEED_VERSION = 'v7';
 
 let state: DB = {};
 let seedFn: (() => DB) | null = null;
@@ -56,6 +56,26 @@ function migrateV3ToV4(raw: DB): DB {
 function migrateV4ToV5(raw: DB): DB {
   const accounts = (raw.accounts ?? []).map((a) => (a.code === '2110' && a.controlType === 'AP' ? { ...a, isControl: false, controlType: undefined } : a));
   return { ...raw, accounts };
+}
+
+/**
+ * v7: sales-invoice enhancements (invoice type / RCM / voucher types / invoice discount). Additive only:
+ * appends the seeded 5540 Discount Allowed account, the voucher types and their series, and copies the
+ * demo LUT onto the seeded company when it has none. Tenant documents are untouched — every new field
+ * is optional and older documents keep computing exactly as before.
+ */
+function migrateV6ToV7(raw: DB): DB {
+  const fresh = seedFn ? seedFn() : {};
+  const appendMissing = (col: string) => {
+    const have = new Set((raw[col] ?? []).map((r) => r.id));
+    return [...(raw[col] ?? []), ...(fresh[col] ?? []).filter((r) => !have.has(r.id))];
+  };
+  const companies = (raw.companies ?? []).map((c) => {
+    const seeded = (fresh.companies ?? []).find((f) => f.id === c.id);
+    const lut = seeded?.defaults?.tax?.lutNumber;
+    return lut && !c.defaults?.tax?.lutNumber ? { ...c, defaults: { ...c.defaults, tax: { ...(c.defaults?.tax ?? {}), lutNumber: lut, lutValidFrom: seeded.defaults.tax.lutValidFrom, lutValidTo: seeded.defaults.tax.lutValidTo } } } : c;
+  });
+  return { ...raw, accounts: appendMissing('accounts'), voucherTypes: appendMissing('voucherTypes'), numberSeries: appendMissing('numberSeries'), companies };
 }
 
 function persist() {
@@ -115,18 +135,23 @@ export const db = {
           state = parsed.state;
           return;
         }
+        if ((parsed?.v === 'v5' || parsed?.v === 'v6') && parsed.state && typeof parsed.state === 'object') {
+          state = migrateV6ToV7(parsed.state);
+          persist();
+          return;
+        }
         if (parsed?.v === 'v4' && parsed.state && typeof parsed.state === 'object') {
-          state = migrateV4ToV5(parsed.state);
+          state = migrateV6ToV7(migrateV4ToV5(parsed.state));
           persist();
           return;
         }
         if (parsed?.v === 'v3' && parsed.state && typeof parsed.state === 'object') {
-          state = migrateV4ToV5(migrateV3ToV4(parsed.state));
+          state = migrateV6ToV7(migrateV4ToV5(migrateV3ToV4(parsed.state)));
           persist();
           return;
         }
         if ((parsed?.v === 'v1' || parsed?.v === 'v2') && parsed.state && typeof parsed.state === 'object') {
-          state = migrateV4ToV5(migrateV3ToV4(migrateV1ToV2(parsed.state)));
+          state = migrateV6ToV7(migrateV4ToV5(migrateV3ToV4(migrateV1ToV2(parsed.state))));
           persist();
           return;
         }

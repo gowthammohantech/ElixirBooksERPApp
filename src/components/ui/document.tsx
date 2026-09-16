@@ -7,6 +7,7 @@ import { fmtMoney, fmtDateTime, fmtQty, fmtDate, uid } from '../../lib/format';
 import { Badge, Button, Money, SnapshotTag, TwoLine, Identifier, EmptyState, Pill } from './primitives';
 import { EntityPicker, NumberField, SelectField, useItemOptions, useTaxRateOptions, useWarehouseOptions, TextField } from './fields';
 import { Explain, ActionMenu } from './overlays';
+import { BatchCell, LineDimensionsCell } from './lineExtras';
 import { PlusIcon, XIcon, FileTextIcon, ShieldCheckIcon, LockIcon, ArrowLeftIcon, ChevronDownIcon, CheckIcon, ArrowRightIcon, AlertCircleIcon, CircleDotIcon, CheckCircleIcon, AlertTriangleIcon } from '../Icons';
 
 // ── Line item grid (design §7.8) ──────────────────────────────────────────
@@ -24,6 +25,11 @@ export interface LineGridProps {
   showTax?: boolean;
   showAccount?: boolean;
   showBatch?: boolean;
+  /** stock direction of the batch cell: 'out' offers on-hand lots (sales), 'in' captures mfg / expiry (purchase) */
+  stockDirection?: 'in' | 'out';
+  /** per-line Department / Cost centre / Project overriding the header (`headerDimensions` shows as the inherited default) */
+  showDimensions?: boolean;
+  headerDimensions?: Record<string, string>;
   itemFilter?: (i: Item) => boolean;
   /** source-linked: show remaining eligibility helper and cap qty */
   sourceLinked?: boolean;
@@ -32,7 +38,7 @@ export interface LineGridProps {
   extraColumns?: { key: string; label: string; render: (l: DocLine, i: number) => ReactNode; width?: number }[];
 }
 
-export function LineItemGrid({ lines, onChange, readOnly, direction = 'sale', partyId, priceListId, currency = 'INR', showWarehouse, showDiscount = true, showTax = true, showAccount, showBatch, itemFilter, sourceLinked, totals, extraColumns }: LineGridProps) {
+export function LineItemGrid({ lines, onChange, readOnly, direction = 'sale', partyId, priceListId, currency = 'INR', showWarehouse, showDiscount = true, showTax = true, showAccount, showBatch, stockDirection, showDimensions, headerDimensions, itemFilter, sourceLinked, totals, extraColumns }: LineGridProps) {
   const items = useItemOptions(itemFilter);
   const taxOpts = useTaxRateOptions();
   const whOpts = useWarehouseOptions();
@@ -55,12 +61,14 @@ export function LineItemGrid({ lines, onChange, readOnly, direction = 'sale', pa
     const fresh = engine.lineFromItem(itemId, { qty: l.qty || 1, customerId: direction === 'sale' ? partyId : undefined, supplierId: direction === 'purchase' ? partyId : undefined, priceListId, direction, warehouseId: l.warehouseId ?? scope.company?.defaults.warehouseId });
     update(lineId, { ...fresh, id: lineId });
   };
-  const cols = 3 + 1 + 1 + 1 + 1 + (showDiscount ? 1 : 0) + (showTax ? 1 : 0) + (showWarehouse ? 1 : 0) + (showAccount ? 1 : 0) + (showBatch ? 1 : 0) + (extraColumns?.length ?? 0) + (readOnly ? 0 : 1);
+  const cols = 3 + 1 + 1 + 1 + 1 + (showDiscount ? 1 : 0) + (showTax ? 1 : 0) + (showWarehouse ? 1 : 0) + (showAccount ? 1 : 0) + (showBatch ? 1 : 0) + (showDimensions ? 1 : 0) + (extraColumns?.length ?? 0) + (readOnly ? 0 : 1);
   const errCount = Object.keys(errors).length;
+  // keep every column at its intended width — the wrapper scrolls sideways instead of squeezing inputs
+  const minWidth = 36 + 260 + 90 + 100 + 70 + 120 + 130 + (showDiscount ? 80 : 0) + (showTax ? 140 : 0) + (showWarehouse ? 150 : 0) + (showBatch ? 150 : 0) + (showAccount ? 160 : 0) + (showDimensions ? 170 : 0) + (extraColumns?.reduce((s, c) => s + (c.width ?? 120), 0) ?? 0) + (readOnly ? 0 : 40);
   return (
     <div className="card" style={{ overflow: 'visible' }}>
       <div style={{ overflowX: 'auto' }}>
-        <table className="data-table dense">
+        <table className="data-table dense" style={{ minWidth }}>
           <thead>
             <tr>
               <th style={{ width: 36 }}>#</th>
@@ -72,8 +80,9 @@ export function LineItemGrid({ lines, onChange, readOnly, direction = 'sale', pa
               {showDiscount && <th className="right" style={{ width: 80 }}>Disc %</th>}
               {showTax && <th style={{ width: 140 }}>Tax</th>}
               {showWarehouse && <th style={{ width: 150 }}>Warehouse</th>}
-              {showBatch && <th style={{ width: 120 }}>Batch / Serial</th>}
+              {showBatch && <th style={{ width: 150 }}>Batch / lot / serial</th>}
               {showAccount && <th style={{ width: 160 }}>Account</th>}
+              {showDimensions && <th style={{ width: 170 }}>Dept · CC · Project</th>}
               {extraColumns?.map((c) => <th key={c.key} style={{ width: c.width }}>{c.label}</th>)}
               <th className="right" style={{ width: 130 }}>Amount</th>
               {!readOnly && <th style={{ width: 40 }} />}
@@ -166,11 +175,7 @@ export function LineItemGrid({ lines, onChange, readOnly, direction = 'sale', pa
                   )}
                   {showBatch && (
                     <td>
-                      {readOnly || item?.tracking === 'None' || !item ? <span style={{ fontSize: 12 }}>{l.batch ?? (l.serials?.length ? `${l.serials.length} serials` : '—')}</span> : item.tracking === 'Batch' ? (
-                        <input className="field-input grid" placeholder="Batch no." value={l.batch ?? ''} onChange={(e) => update(l.id, { batch: e.target.value })} />
-                      ) : (
-                        <input className="field-input grid" placeholder="Serials, comma-separated" value={(l.serials ?? []).join(',')} onChange={(e) => update(l.id, { serials: e.target.value.split(',').map((s) => s.trim()).filter(Boolean) })} />
-                      )}
+                      <BatchCell line={l} item={item} qty={l.qty} direction={stockDirection ?? (direction === 'purchase' ? 'in' : 'out')} warehouseId={l.warehouseId} readOnly={readOnly} onChange={(p) => update(l.id, p)} />
                     </td>
                   )}
                   {showAccount && (
@@ -183,6 +188,7 @@ export function LineItemGrid({ lines, onChange, readOnly, direction = 'sale', pa
                       )}
                     </td>
                   )}
+                  {showDimensions && <td><LineDimensionsCell value={l.dimensions} header={headerDimensions} readOnly={readOnly} onChange={(v) => update(l.id, { dimensions: v })} /></td>}
                   {extraColumns?.map((c) => <td key={c.key}>{c.render(l, i)}</td>)}
                   <td className="right"><span className="money" style={{ fontWeight: 500 }}>{fmtMoney(l.amount, currency)}</span></td>
                   {!readOnly && (
@@ -217,25 +223,39 @@ export function LineItemGrid({ lines, onChange, readOnly, direction = 'sale', pa
 
 // ── Totals ladder & tax breakup (design §7.9) ─────────────────────────────
 
-export function TotalsLadder({ totals, currency = 'INR', baseCurrency, rate, extraRows, showPaid = true }: { totals: DocTotals; currency?: string; baseCurrency?: string; rate?: number; extraRows?: { label: string; value: number; tone?: 'positive' | 'negative' }[]; showPaid?: boolean }) {
-  const rows: { label: string; value: number; tone?: 'positive' | 'negative'; hide?: boolean }[] = [
+/** Rows of the totals ladder shared by the on-screen summary and the print sheet (design §7.9). */
+export function ladderRows(totals: DocTotals, opts: { showChargeBreakup?: boolean } = {}): { label: string; value: number; tone?: 'positive' | 'negative'; muted?: boolean; info?: boolean }[] {
+  const dd = totals.docDiscount ?? 0;
+  const chargeRows = opts.showChargeBreakup && totals.chargeRows?.length ? totals.chargeRows : undefined;
+  return [
     { label: 'Subtotal', value: totals.subtotal },
-    { label: 'Discount', value: -totals.discount, tone: 'positive', hide: !totals.discount },
+    ...(totals.discount ? [{ label: 'Discount', value: -totals.discount, tone: 'positive' as const }] : []),
+    ...(dd && !totals.docDiscountAfterTax ? [{ label: 'Invoice discount', value: -dd, tone: 'positive' as const }] : []),
     { label: 'Taxable value', value: totals.taxable },
     ...Object.entries(totals.components).map(([k, v]) => ({ label: k, value: v })),
-    { label: 'Charges', value: totals.charges, hide: !totals.charges },
-    { label: `TDS${totals.tdsSection ? ` (${totals.tdsSection})` : ''}`, value: -totals.tds, tone: 'positive', hide: !totals.tds },
-    { label: 'Round-off', value: totals.roundOff, hide: !totals.roundOff },
-    ...(extraRows ?? []),
+    ...(chargeRows ? chargeRows.map((c) => ({ label: `${c.name}${c.tax && !c.reverseCharge ? ` (+ tax ${fmtMoney(c.tax)})` : ''}`, value: c.amount, muted: true })) : totals.charges ? [{ label: 'Charges', value: totals.charges }] : []),
+    ...(dd && totals.docDiscountAfterTax ? [{ label: 'Invoice discount (after tax)', value: -dd, tone: 'positive' as const }] : []),
+    ...(totals.tds ? [{ label: `TDS${totals.tdsSection ? ` (${totals.tdsSection})` : ''}`, value: -totals.tds, tone: 'positive' as const }] : []),
+    ...(totals.roundOff ? [{ label: 'Round-off', value: totals.roundOff }] : []),
   ];
+}
+
+export function TotalsLadder({ totals, currency = 'INR', baseCurrency, rate, extraRows, showPaid = true, showChargeBreakup }: { totals: DocTotals; currency?: string; baseCurrency?: string; rate?: number; extraRows?: { label: string; value: number; tone?: 'positive' | 'negative' }[]; showPaid?: boolean; showChargeBreakup?: boolean }) {
+  const rows = [...ladderRows(totals, { showChargeBreakup }), ...(extraRows ?? [])];
   return (
     <div className="summary-block">
-      {rows.filter((r) => !r.hide).map((r) => (
+      {rows.map((r) => (
         <div key={r.label} className="ladder-row">
-          <span className="ladder-label">{r.label}</span>
+          <span className="ladder-label" style={(r as any).muted ? { paddingLeft: 10, color: 'var(--ink-4)' } : undefined}>{r.label}</span>
           <span className={`ladder-value ${r.tone ?? ''}`}>{fmtMoney(r.value, currency)}</span>
         </div>
       ))}
+      {!!totals.rcmTax && (
+        <div className="ladder-row" title="Reverse charge — tax payable by the recipient, not added to the total">
+          <span className="ladder-label" style={{ color: 'var(--warn)' }}>Tax under RCM ({Object.entries(totals.rcmComponents ?? {}).map(([k, v]) => `${k} ${fmtMoney(v, currency)}`).join(' · ')})</span>
+          <span className="ladder-value" style={{ color: 'var(--ink-4)', textDecoration: 'line-through' }}>{fmtMoney(totals.rcmTax, currency)}</span>
+        </div>
+      )}
       <div style={{ height: 1, background: 'var(--ink-2)', margin: '6px 0' }} />
       <div className="ladder-row">
         <span className="ladder-label" style={{ fontWeight: 600, color: 'var(--ink)' }}>Total</span>
@@ -260,18 +280,33 @@ export function TotalsLadder({ totals, currency = 'INR', baseCurrency, rate, ext
   );
 }
 
-export function TaxBreakup({ totals, currency = 'INR' }: { totals: DocTotals; currency?: string }) {
-  if (!totals.breakup.length) return <div style={{ fontSize: 13, color: 'var(--ink-3)' }}>No tax applies.</div>;
+export function TaxBreakup({ totals, currency = 'INR', showChargeBreakup, onToggleChargeBreakup }: { totals: DocTotals; currency?: string; showChargeBreakup?: boolean; onToggleChargeBreakup?: (v: boolean) => void }) {
+  const charges = totals.chargeRows ?? [];
+  const toggle = onToggleChargeBreakup && charges.length > 0 ? (
+    <label style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, color: 'var(--ink-3)', padding: '8px 12px', borderBottom: '1px solid var(--line)', cursor: 'pointer' }} title="List each charge (freight, packing, insurance…) with its taxable value and tax instead of one Charges line">
+      <input type="checkbox" checked={!!showChargeBreakup} onChange={(e) => onToggleChargeBreakup(e.target.checked)} /> Show charge breakup
+    </label>
+  ) : null;
+  if (!totals.breakup.length && !(showChargeBreakup && charges.length)) return <div style={{ fontSize: 13, color: 'var(--ink-3)' }}>{toggle}No tax applies.</div>;
+  // with the breakup on, the aggregated "Charges" rows are replaced by one row per charge
+  const rows = showChargeBreakup && charges.length ? totals.breakup.filter((r) => r.hsn !== 'Charges') : totals.breakup;
   return (
-    <div className="card" style={{ overflow: 'hidden' }}>
-      <table className="data-table dense">
-        <thead><tr><th>Component</th><th className="right">Rate</th><th>HSN/SAC</th><th className="right">Taxable</th><th className="right">Tax</th></tr></thead>
+    <div className="card" style={{ overflow: 'auto' }}>
+      {toggle}
+      <table className="data-table dense" style={{ fontSize: 12 }}>
+        <thead><tr><th>Component · HSN/SAC</th><th className="right">Rate</th><th className="right">Taxable</th><th className="right">Tax</th></tr></thead>
         <tbody>
-          {totals.breakup.map((r, i) => (
-            <tr key={i}><td>{r.component}</td><td className="right money">{r.rate}%</td><td className="identifier">{r.hsn}</td><td className="right money">{fmtMoney(r.taxable, currency)}</td><td className="right money">{fmtMoney(r.tax, currency)}</td></tr>
+          {rows.map((r, i) => (
+            <tr key={i} style={r.reverseCharge ? { color: 'var(--ink-3)' } : undefined}><td>{r.component}{r.reverseCharge ? <span className="snapshot-tag" style={{ marginLeft: 6 }}>RCM</span> : null}<span className="identifier" style={{ color: 'var(--ink-4)', fontSize: 11, marginLeft: 6 }}>{r.hsn}</span></td><td className="right money">{r.rate}%</td><td className="right money">{fmtMoney(r.taxable, currency)}</td><td className="right money">{fmtMoney(r.tax, currency)}</td></tr>
+          ))}
+          {showChargeBreakup && charges.map((c) => (
+            <tr key={c.id} style={{ background: 'var(--surface-2)' }} title={c.taxRate ? `${Object.keys(c.components).join(' + ')} ${c.taxRate}%` : 'No tax on this charge'}><td style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 140 }}>{c.name}{c.reverseCharge ? <span className="snapshot-tag" style={{ marginLeft: 6 }}>RCM</span> : null}<span style={{ color: 'var(--ink-4)', fontSize: 11, marginLeft: 6 }}>charge</span></td><td className="right money">{c.taxRate ? `${c.taxRate}%` : '—'}</td><td className="right money">{fmtMoney(c.amount, currency)}</td><td className="right money">{fmtMoney(c.tax, currency)}</td></tr>
           ))}
         </tbody>
-        <tfoot><tr><td colSpan={3}>Total</td><td className="right money">{fmtMoney(totals.taxable, currency)}</td><td className="right money">{fmtMoney(totals.tax, currency)}</td></tr></tfoot>
+        <tfoot>
+          <tr><td colSpan={2}>Total{totals.rcmTax ? ' (excl. RCM)' : ''}{totals.charges ? <span style={{ color: 'var(--ink-4)', fontWeight: 400 }}> · charges {fmtMoney(totals.charges, currency)}</span> : null}</td><td className="right money">{fmtMoney(totals.taxable, currency)}</td><td className="right money">{fmtMoney(totals.tax, currency)}</td></tr>
+          {!!totals.rcmTax && <tr><td colSpan={3} style={{ color: 'var(--warn)' }}>Payable by recipient under reverse charge</td><td className="right money" style={{ color: 'var(--warn)' }}>{fmtMoney(totals.rcmTax, currency)}</td></tr>}
+        </tfoot>
       </table>
     </div>
   );
