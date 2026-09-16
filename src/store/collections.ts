@@ -31,6 +31,7 @@ export const C = {
   currencies: 'currencies',
   exchangeRates: 'exchangeRates',
   numberSeries: 'numberSeries',
+  voucherTypes: 'voucherTypes',
   paymentTerms: 'paymentTerms',
   uoms: 'uoms',
   hsnCodes: 'hsnCodes',

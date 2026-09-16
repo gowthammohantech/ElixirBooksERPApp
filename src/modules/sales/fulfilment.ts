@@ -4,7 +4,7 @@ import type { ApprovalRequest, Customer, DocLine, Item, Reservation, StockMoveme
 import { addDays, fmtMoney, round, today, uid } from '../../lib/format';
 import type { Delivery, Quotation, SalesInvoice, SalesOrder } from './types';
 import { salesSettingsOf } from './types';
-import { assertValid, defaultTemplateFor, recompute, refreshOrderStatus, validateSalesDoc } from './core';
+import { assertValid, defaultTemplateFor, recompute, refreshOrderStatus, validateSalesDoc, invoiceDefaults } from './core';
 
 // ── Quotations (FR-SAL-001..004) ───────────────────────────────────────────
 
@@ -368,8 +368,7 @@ export function validateDelivery(d: Delivery): string[] {
     if (!item.isStock) errs.push(`Line ${i + 1}: ${item.name} is a service and cannot be delivered`);
     const wh = l.warehouseId ?? d.warehouseId;
     if (!wh) errs.push(`Line ${i + 1}: choose a warehouse`);
-    if (item.tracking === 'Batch' && !l.batch) errs.push(`Line ${i + 1}: ${item.name} is batch-tracked — enter the batch`);
-    if (item.tracking === 'Serial' && (l.serials?.length ?? 0) !== l.qty) errs.push(`Line ${i + 1}: ${item.name} needs ${l.qty} serial number(s)`);
+    engine.validateLineStock(l, item, l.qty, { direction: 'out', warehouseId: wh, itemId: item.id, allowNegative: engine.ctx().company?.defaults.allowNegativeStock }).forEach((m) => errs.push(`Line ${i + 1}: ${m}`));
     if (l.sourceDocId && l.sourceLineId) {
       const so = db.find<SalesOrder>(C.salesOrders, l.sourceDocId);
       const sl = so?.lines.find((x) => x.id === l.sourceLineId);
@@ -378,7 +377,7 @@ export function validateDelivery(d: Delivery): string[] {
         if (l.qty > remaining + 0.0005) errs.push(`Line ${i + 1}: ${l.qty} exceeds remaining ${remaining} on ${so!.number}`);
       }
     }
-    if (wh) {
+    if (wh && !l.breakup?.length) {
       const pos = engine.stockPosition(item.id, wh, { batch: l.batch || undefined });
       const allowNeg = engine.ctx().company?.defaults.allowNegativeStock;
       if (!allowNeg && pos.onHand < l.qty) errs.push(`Line ${i + 1}: only ${pos.onHand} ${item.baseUom} of ${item.name} on hand in ${db.find<any>(C.warehouses, wh)?.name}${l.batch ? ` (batch ${l.batch})` : ''}`);
@@ -402,7 +401,7 @@ export function postDelivery(id: string): Delivery {
     const moved: StockMovement[] = [];
     d.lines.forEach((l) => {
       const wh = l.warehouseId ?? d.warehouseId!;
-      moved.push(engine.moveStock({ date: d.date, itemId: l.itemId!, warehouseId: wh, qty: -l.qty, uom: l.uom, type: 'Delivery', sourceType: 'Delivery', sourceId: d.id, sourceNumber: number, batch: l.batch || undefined, serials: l.serials }));
+      engine.lineStockRows(l, l.qty).forEach((r) => moved.push(engine.moveStock({ date: d.date, itemId: l.itemId!, warehouseId: wh, qty: -r.qty, uom: l.uom, type: 'Delivery', sourceType: 'Delivery', sourceId: d.id, sourceNumber: number, batch: r.batch, serials: r.serials })));
       if (l.sourceDocId && l.sourceLineId) {
         engine.fulfilReservation(l.sourceDocId, l.sourceLineId, l.qty);
         db.update<SalesOrder>(C.salesOrders, l.sourceDocId, (prev) => ({ lines: prev.lines.map((x) => (x.id === l.sourceLineId ? { ...x, deliveredQty: round((x.deliveredQty ?? 0) + l.qty, 3), remainingQty: round(Math.max(0, x.qty - (x.deliveredQty ?? 0) - l.qty), 3) } : x)) }));
@@ -500,7 +499,7 @@ export function invoiceFromSource(src: SalesOrder | Delivery, kind: 'order' | 'd
   const date = today();
   const lines = kind === 'order' ? invoiceLinesFromOrder(src as SalesOrder) : invoiceLinesFromDelivery(src as Delivery);
   const base = engine.newDocHeader('Sales Invoice', { date, dueDate: engine.dueDateFor(date, terms), paymentTerms: terms, branchId: src.branchId, currency: src.currency, rate: src.rate, rateType: src.rateType, partyType: 'Customer', partyId: src.partyId, partyName: src.partyName, partySnapshot: src.partySnapshot, placeOfSupply: src.placeOfSupply, placeOfSupplyCode: src.placeOfSupplyCode, salespersonId: src.salespersonId ?? cust?.salespersonId, priceListId: src.priceListId ?? cust?.priceListId, reference: src.reference, terms: src.terms, notes: src.notes, dimensions: src.dimensions, charges: kind === 'order' ? src.charges : undefined, warehouseId: src.warehouseId, sourceType: kind === 'order' ? 'Sales Order' : 'Delivery', sourceId: src.id, sourceNumber: src.number, lines, correlationId: src.correlationId, ...defaultTemplateFor('Sales Invoice') });
-  const inv: SalesInvoice = { ...base, tdsSectionId: cust?.tdsSectionId, roundTotal: true, deliveryIds: kind === 'delivery' ? [src.id] : undefined };
+  const inv: SalesInvoice = { ...base, ...invoiceDefaults({ customer: cust, branchId: src.branchId }), tdsSectionId: cust?.tdsSectionId, roundTotal: true, deliveryIds: kind === 'delivery' ? [src.id] : undefined };
   return recompute(inv);
 }
 

@@ -2,7 +2,7 @@
 // validation and order-status derivation. Imported by actions.ts and
 // fulfilment.ts (kept separate to avoid circular imports).
 import { db, C, engine, ValidationError, IDS } from '../../store';
-import type { Customer, DocHeader, DocLine, DocumentTemplate, ID, Item, TaxRate } from '../../store';
+import type { Customer, DocHeader, DocLine, DocumentTemplate, ID, Item, TaxRate, VoucherType } from '../../store';
 import { round } from '../../lib/format';
 import type { SalesInvoice, SalesOrder } from './types';
 import { salesSettingsOf } from './types';
@@ -37,6 +37,12 @@ export function salesAccountFor(line: DocLine): string {
   return item?.salesAccountId ?? engine.ctx().company?.defaults.salesAccountId ?? ACC.sales;
 }
 
+/** Account for an after-tax document discount: company setting → seeded 5580 "Discount Allowed" → netted against sales. */
+export function discountAccountFor(): string {
+  const co = engine.ctx().company;
+  return co?.defaults.discountAllowedAccountId ?? db.findBy<any>(C.accounts, (a) => a.id === IDS.accDiscountAllowed || (a.code === '5580' && a.status === 'Active' && (!a.companyId || a.companyId === co?.id)))?.id ?? co?.defaults.salesAccountId ?? ACC.sales;
+}
+
 export function taxAccountFor(component: string, taxRateId?: string): string {
   const tr = db.find<TaxRate>(C.taxRates, taxRateId);
   const mapped = tr?.outputAccountIds?.[component];
@@ -46,15 +52,15 @@ export function taxAccountFor(component: string, taxRateId?: string): string {
 
 // ── Recompute (every form change) ──────────────────────────────────────────
 
-export function taxContextForDoc(doc: Pick<DocHeader, 'partyId' | 'branchId' | 'placeOfSupplyCode'>) {
-  return engine.taxContextFor('Customer', doc.partyId, 'sale', doc.branchId, doc.placeOfSupplyCode);
+export function taxContextForDoc(doc: Pick<DocHeader, 'partyId' | 'branchId' | 'placeOfSupplyCode'> & Partial<Pick<DocHeader, 'invoiceType' | 'reverseCharge'>>) {
+  return engine.taxContextFor('Customer', doc.partyId, 'sale', doc.branchId, doc.placeOfSupplyCode, { invoiceType: doc.invoiceType, reverseCharge: doc.reverseCharge });
 }
 
 /** Recalculate lines + totals for any sales document using the shared engine. */
 export function recompute<T extends DocHeader>(doc: T, opts: { tdsSectionId?: string; roundTotal?: boolean; taxInclusive?: boolean } = {}): T {
   const tc = taxContextForDoc(doc);
   const { lines, totals } = engine.computeDocument(doc.lines, tc, {
-    charges: (doc.charges ?? []).map((c) => ({ name: c.name, amount: c.amount, taxRateId: c.taxRateId })),
+    charges: (doc.charges ?? []).map((c) => ({ id: c.id, name: c.name, amount: c.amount, taxRateId: c.taxRateId })),
     tdsSectionId: opts.tdsSectionId ?? (doc as any).tdsSectionId,
     roundTotal: opts.roundTotal ?? (doc as any).roundTotal ?? true,
     paid: doc.totals?.paid ?? 0,
@@ -62,8 +68,56 @@ export function recompute<T extends DocHeader>(doc: T, opts: { tdsSectionId?: st
     writtenOff: doc.totals?.writtenOff ?? 0,
     rate: doc.rate || 1,
     taxInclusive: opts.taxInclusive,
+    docDiscount: doc.docDiscount,
   });
   return { ...doc, lines, totals };
+}
+
+/** Header defaults a new sales invoice takes from its voucher type, the customer and company settings. */
+export function invoiceDefaults(opts: { customer?: Customer; branchId?: string; voucherTypeId?: string } = {}): Partial<SalesInvoice> {
+  const c = engine.ctx();
+  const s = salesSettingsOf(c.company?.defaults);
+  const vt = db.find<VoucherType>(C.voucherTypes, opts.voucherTypeId) ?? engine.defaultVoucherType('Sales Invoice', { branchId: opts.branchId });
+  const invoiceType = vt?.invoiceType ?? engine.invoiceTypeForTreatment(opts.customer?.taxTreatment);
+  return {
+    voucherTypeId: vt?.id,
+    invoiceType,
+    reverseCharge: vt?.reverseCharge || undefined,
+    bankAccountId: vt?.bankAccountId ?? c.company?.defaults.bankAccountId,
+    showChargeBreakup: s.salesShowChargeBreakup || undefined,
+    ...(vt?.templateId ? { templateId: vt.templateId, templateVersion: db.find<DocumentTemplate>(C.templates, vt.templateId)?.templateVersion } : {}),
+  };
+}
+
+/** Apply a voucher type to a draft: numbering series, supply type, RCM, bank and template defaults. */
+export function applyVoucherType<T extends DocHeader>(doc: T, voucherTypeId: string | undefined): T {
+  const vt = db.find<VoucherType>(C.voucherTypes, voucherTypeId);
+  if (!vt) return { ...doc, voucherTypeId: undefined };
+  const patch: Partial<DocHeader> = { voucherTypeId: vt.id };
+  if (vt.invoiceType) patch.invoiceType = vt.invoiceType;
+  if (vt.reverseCharge !== undefined) patch.reverseCharge = vt.reverseCharge || undefined;
+  if (vt.bankAccountId) patch.bankAccountId = vt.bankAccountId;
+  if (vt.templateId) { patch.templateId = vt.templateId; patch.templateVersion = db.find<DocumentTemplate>(C.templates, vt.templateId)?.templateVersion; }
+  return { ...doc, ...patch };
+}
+
+/** Printed title for a sales invoice: voucher type title, else derived from the supply type. */
+export function invoiceTitle(doc: Pick<DocHeader, 'voucherTypeId' | 'invoiceType'>): string {
+  const vt = db.find<VoucherType>(C.voucherTypes, doc.voucherTypeId);
+  if (vt?.printTitle) return vt.printTitle;
+  const t = doc.invoiceType;
+  if (t === 'EXPWP' || t === 'EXPWOP') return 'Export invoice';
+  if (t === 'SEZWP' || t === 'SEZWOP') return 'Tax invoice — SEZ supply';
+  return 'Tax invoice';
+}
+
+/** Active LUT for the document date, if the company has one configured (Taxation › Settings). */
+export function lutFor(date: string): { number: string; validFrom?: string; validTo?: string } | undefined {
+  const t = engine.ctx().company?.defaults.tax;
+  if (!t?.lutNumber) return undefined;
+  if (t.lutValidFrom && date < t.lutValidFrom) return undefined;
+  if (t.lutValidTo && date > t.lutValidTo) return undefined;
+  return { number: t.lutNumber, validFrom: t.lutValidFrom, validTo: t.lutValidTo };
 }
 
 // ── Validation ─────────────────────────────────────────────────────────────
@@ -84,8 +138,21 @@ export function validateSalesDoc(doc: DocHeader, opts: { requireLines?: boolean 
       const tol = salesSettingsOf(engine.ctx().company?.defaults).salesOverInvoiceTolerancePct;
       if (l.qty > l.remainingQty * (1 + tol / 100) + 0.0005) errs.push({ field: 'lines', message: `Line ${i + 1}: ${l.qty} exceeds remaining eligibility ${l.remainingQty} (+${tol}% tolerance)` });
     }
+    // a multi-batch / serial split must add up to the line (the tracking itself is enforced at post)
+    if (l.breakup?.length) {
+      const sum = round(l.breakup.reduce((s, b) => s + (b.qty || 0), 0), 3);
+      if (Math.abs(sum - l.qty) > 0.0005) errs.push({ field: 'lines', message: `Line ${i + 1}: batch / serial split totals ${sum}, line quantity is ${l.qty}` });
+    }
   });
   if (doc.currency !== engine.ctx().currency && (!doc.rate || doc.rate <= 0)) errs.push({ field: 'rate', message: 'Exchange rate is required for foreign-currency documents' });
+  if (doc.docType === 'Sales Invoice') {
+    const it = engine.invoiceTypeInfo(doc.invoiceType);
+    if (it.zeroRated && !lutFor(doc.date)) errs.push({ field: 'invoiceType', message: `${it.label} needs a valid Letter of Undertaking — enter the LUT number under Taxation › Settings` });
+    if (doc.docDiscount && doc.docDiscount.mode === 'pct' && doc.docDiscount.value > 100) errs.push({ field: 'docDiscount', message: 'Invoice discount cannot exceed 100%' });
+    if (doc.docDiscount && doc.docDiscount.value < 0) errs.push({ field: 'docDiscount', message: 'Invoice discount cannot be negative' });
+    if (doc.shipTo && !doc.shipTo.address.line1?.trim()) errs.push({ field: 'shipTo', message: 'Ship-to address needs at least the first line' });
+    if (doc.dispatchFrom && !doc.dispatchFrom.address.line1?.trim()) errs.push({ field: 'dispatchFrom', message: 'Dispatch-from address needs at least the first line' });
+  }
   return errs;
 }
 
@@ -154,6 +221,8 @@ export function applyCustomer<T extends DocHeader>(doc: T, customerId: string | 
   };
   const out = { ...doc, ...patch } as T;
   if ('tdsSectionId' in doc || doc.docType === 'Sales Invoice') (out as any).tdsSectionId = cust.tdsSectionId;
+  // supply type follows the customer's treatment unless the voucher type pins one
+  if (doc.docType === 'Sales Invoice' && !db.find<VoucherType>(C.voucherTypes, doc.voucherTypeId)?.invoiceType) out.invoiceType = engine.invoiceTypeForTreatment(cust.taxTreatment);
   // re-price lines against the customer's price list
   out.lines = out.lines.map((l) => {
     if (!l.itemId) return l;

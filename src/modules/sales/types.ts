@@ -46,6 +46,7 @@ export interface SalesInvoice extends DocHeader {
   writeOffReason?: string;
   emailedAt?: string;
   emailedTo?: string;
+  /** @deprecated pre-Sep-2026 header discount that overwrote every line's %; superseded by `docDiscount` on DocHeader */
   headerDiscountPct?: number;
 }
 
@@ -104,6 +105,10 @@ export interface SalesSettings {
   salesQuoteValidityDays: number;
   salesReservationDays: number;
   salesAutoReserveOnConfirm: boolean;
+  /** document-level discount: before tax reduces the taxable value (GST default); after tax only reduces the amount payable */
+  salesDiscountApplication: 'Before tax' | 'After tax';
+  /** itemise charges in the tax summary by default on new invoices */
+  salesShowChargeBreakup: boolean;
 }
 
 export const SALES_SETTINGS_DEFAULTS: SalesSettings = {
@@ -114,6 +119,8 @@ export const SALES_SETTINGS_DEFAULTS: SalesSettings = {
   salesQuoteValidityDays: 14,
   salesReservationDays: 14,
   salesAutoReserveOnConfirm: true,
+  salesDiscountApplication: 'Before tax',
+  salesShowChargeBreakup: false,
 };
 
 export function salesSettingsOf(defaults?: CompanyDefaults): SalesSettings {
@@ -126,6 +133,8 @@ export function salesSettingsOf(defaults?: CompanyDefaults): SalesSettings {
     salesQuoteValidityDays: d.salesQuoteValidityDays ?? SALES_SETTINGS_DEFAULTS.salesQuoteValidityDays,
     salesReservationDays: d.salesReservationDays ?? SALES_SETTINGS_DEFAULTS.salesReservationDays,
     salesAutoReserveOnConfirm: d.salesAutoReserveOnConfirm ?? SALES_SETTINGS_DEFAULTS.salesAutoReserveOnConfirm,
+    salesDiscountApplication: d.salesDiscountApplication ?? SALES_SETTINGS_DEFAULTS.salesDiscountApplication,
+    salesShowChargeBreakup: d.salesShowChargeBreakup ?? SALES_SETTINGS_DEFAULTS.salesShowChargeBreakup,
   };
 }
 

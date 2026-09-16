@@ -28,7 +28,7 @@ function rowFrom(collection: string, d: DocHeader, sign: 1 | -1): GstRegisterRow
   const posName = d.placeOfSupply ?? d.partySnapshot?.state ?? (posCode ? stateNameOf(posCode) : undefined);
   const lines = d.lines ?? [];
   const isSale = collection === C.salesInvoices || collection === C.creditNotes || collection === C.posBills || collection === C.deliveries;
-  const applicable = isSale && !!d.partySnapshot?.gstin && d.partySnapshot?.taxTreatment !== 'Unregistered';
+  const applicable = isSale && engine.eInvoiceApplicable(d);
   const eInv = d.statutory?.eInvoiceStatus ?? (applicable ? 'Pending' : 'Not Applicable');
   const hsnMap = new Map<string, { hsn: string; taxable: number; tax: number; qty: number; rate: number }>();
   lines.forEach((l) => {
@@ -49,10 +49,10 @@ function rowFrom(collection: string, d: DocHeader, sign: 1 | -1): GstRegisterRow
   }
   return {
     id: `${collection}:${d.id}`, collection, docId: d.id, docType: d.docType, number: d.number, date: d.date, period: d.date.slice(0, 7),
-    party: d.partyName ?? d.partySnapshot?.name ?? 'Walk-in customer', gstin: d.partySnapshot?.gstin ?? supplier?.gstin, treatment: d.partySnapshot?.taxTreatment,
+    party: d.partyName ?? d.partySnapshot?.name ?? 'Walk-in customer', gstin: d.partySnapshot?.gstin ?? supplier?.gstin, treatment: d.partySnapshot?.taxTreatment, supplyType: isSale ? (d.invoiceType ?? undefined) : undefined, rcmTax: d.totals?.rcmTax ? round(d.totals.rcmTax * sign) : undefined,
     pos: posCode ? `${posCode}-${posName ?? ''}` : posName ?? '—', posCode,
     taxable: round((d.totals?.taxable ?? 0) * sign), cgst: round((comps.CGST ?? 0) * sign), sgst: round((comps.SGST ?? 0) * sign), igst: round((comps.IGST ?? 0) * sign), cess: round((comps.CESS ?? 0) * sign), tax: round((d.totals?.tax ?? 0) * sign), total: round((d.totals?.total ?? 0) * sign),
-    reverseCharge: lines.some((l) => l.reverseCharge), eInvoiceStatus: eInv, ewbStatus: d.statutory?.ewbStatus, ewbNo: d.statutory?.ewbNo, ewbValidUpto: d.statutory?.ewbValidUpto,
+    reverseCharge: !!d.reverseCharge || lines.some((l) => l.reverseCharge), eInvoiceStatus: eInv, ewbStatus: d.statutory?.ewbStatus, ewbNo: d.statutory?.ewbNo, ewbValidUpto: d.statutory?.ewbValidUpto,
     hsnMissing: lines.some((l) => !l.hsn), itcEligible, itcIneligibleReason, sign, link: docLink(collection, d.id), registrationId: branch?.registrationId, hsnRows: Array.from(hsnMap.values()), branchId: d.branchId,
   };
 }
@@ -70,12 +70,17 @@ function inScope(d: DocHeader, f: RegisterFilter): boolean {
   return true;
 }
 
+/** Export / SEZ / deemed-export supplies belong with B2B (GSTR-1 6A / 3B 3.1(b)) even when the overseas buyer has no GSTIN. */
+const isB2b = (d: DocHeader) => (!!d.partySnapshot?.gstin && d.partySnapshot?.taxTreatment !== 'Unregistered') || (!!d.invoiceType && d.invoiceType !== 'Regular');
+/** Zero-rated / SEZ / deemed-export row — by the document's supply type, else by the customer's treatment (older documents). */
+export const isExportRow = (r: GstRegisterRow) => (r.supplyType ? r.supplyType !== 'Regular' : r.treatment === 'SEZ' || r.treatment === 'Export' || r.treatment === 'Overseas' || r.treatment === 'Deemed Export');
+
 export function b2bRegister(f: RegisterFilter = {}): GstRegisterRow[] {
-  return db.where<DocHeader>(C.salesInvoices, (d) => isPosted(d) && inScope(d, f) && !!d.partySnapshot?.gstin && d.partySnapshot?.taxTreatment !== 'Unregistered').map((d) => rowFrom(C.salesInvoices, d, 1)).sort((a, b) => b.date.localeCompare(a.date));
+  return db.where<DocHeader>(C.salesInvoices, (d) => isPosted(d) && inScope(d, f) && isB2b(d)).map((d) => rowFrom(C.salesInvoices, d, 1)).sort((a, b) => b.date.localeCompare(a.date));
 }
 
 export function b2cRegister(f: RegisterFilter = {}): GstRegisterRow[] {
-  const inv = db.where<DocHeader>(C.salesInvoices, (d) => isPosted(d) && inScope(d, f) && (!d.partySnapshot?.gstin || d.partySnapshot?.taxTreatment === 'Unregistered')).map((d) => rowFrom(C.salesInvoices, d, 1));
+  const inv = db.where<DocHeader>(C.salesInvoices, (d) => isPosted(d) && inScope(d, f) && !isB2b(d)).map((d) => rowFrom(C.salesInvoices, d, 1));
   const pos = db.where<DocHeader>(C.posBills, (d) => isPosted(d) && inScope(d, f)).map((d) => rowFrom(C.posBills, d, 1));
   return [...inv, ...pos].sort((a, b) => b.date.localeCompare(a.date));
 }
@@ -132,8 +137,9 @@ export function gstr1Sections(period: string, registrationId?: string): { sectio
   const homeState = branch?.address?.stateCode ?? engine.ctx().company?.address.stateCode;
   const b2cLarge = b2c.filter((r) => r.posCode && r.posCode !== homeState && r.total > 250000);
   const b2cSmall = b2c.filter((r) => !b2cLarge.includes(r));
-  const exports = b2b.filter((r) => r.treatment === 'SEZ' || r.treatment === 'Export' || r.treatment === 'Overseas' || r.treatment === 'Deemed Export');
+  const exports = b2b.filter(isExportRow);
   const b2bReg = b2b.filter((r) => !exports.includes(r));
+  const rcmOut = b2bReg.filter((r) => r.reverseCharge);
   const nil = [...b2bReg, ...b2c].filter((r) => r.tax === 0 && r.taxable > 0);
   const cdnReg = cdn.filter((r) => r.gstin);
   const cdnUnreg = cdn.filter((r) => !r.gstin);
@@ -142,7 +148,8 @@ export function gstr1Sections(period: string, registrationId?: string): { sectio
   const hsn = Array.from(hsnMap.values()).sort((a, b) => b.taxable - a.taxable);
   const hsnTot = hsn.reduce((t, h) => ({ taxable: t.taxable + h.taxable, tax: t.tax + h.tax }), { taxable: 0, tax: 0 });
   const sections: ReturnSection[] = [
-    mk('4A', 'B2B supplies to registered persons', b2bReg),
+    mk('4A', 'B2B supplies to registered persons', b2bReg.filter((r) => !r.reverseCharge)),
+    { ...mk('4B', 'B2B supplies attracting reverse charge (tax payable by recipient)', rcmOut), tax: round(rcmOut.reduce((s, r) => s + (r.rcmTax ?? 0), 0)) },
     mk('5A', 'B2C Large (inter-state, invoice > ₹2.5 L)', b2cLarge),
     mk('6A', 'Exports / SEZ supplies (zero-rated)', exports),
     mk('7', 'B2C Small (unregistered)', b2cSmall),
@@ -160,7 +167,7 @@ export function gstr3bSections(period: string, registrationId?: string) {
   const f = { period, registrationId };
   const b2b = b2bRegister(f), b2c = b2cRegister(f), cdn = cdnRegister(f), pur = purchaseRegister(f);
   const out = sumRows([...b2b, ...b2c, ...cdn.filter((r) => r.collection === C.creditNotes)]);
-  const zero = sumRows(b2b.filter((r) => r.treatment === 'SEZ' || r.treatment === 'Export' || r.treatment === 'Overseas'));
+  const zero = sumRows(b2b.filter((r) => isExportRow(r) && r.supplyType !== 'DEXP' && r.treatment !== 'Deemed Export'));
   const nil = sumRows([...b2b, ...b2c].filter((r) => r.tax === 0));
   const rcm = sumRows(pur.filter((r) => r.reverseCharge));
   const eligible = sumRows(pur.filter((r) => r.itcEligible));

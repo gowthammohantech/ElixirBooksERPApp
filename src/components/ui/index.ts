@@ -4,6 +4,7 @@ export * from './fields';
 export * from './overlays';
 export * from './DataTable';
 export * from './document';
+export * from './lineExtras';
 export * from './printsheet';
 export * from './composites';
 export * from './charts';

@@ -7,7 +7,7 @@ import type { DocHeader, DocLine, Item, OpenItem, ApprovalRequest, ID, StockMove
 import { fmtMoney, round, today, uid } from '../../lib/format';
 import type { CreditNote, Receipt, SalesInvoice, SalesOrder, Delivery, SalesReturn } from './types';
 import { salesSettingsOf } from './types';
-import { ACC, arAccountFor, salesAccountFor, taxAccountFor, taxContextForDoc, recompute, assertValid, validateSalesDoc, refreshOrderStatus, duplicateReference, defaultTemplateFor } from './core';
+import { ACC, arAccountFor, salesAccountFor, taxAccountFor, taxContextForDoc, recompute, assertValid, validateSalesDoc, refreshOrderStatus, duplicateReference, defaultTemplateFor, invoiceDefaults, discountAccountFor } from './core';
 
 export * from './core';
 export * from './fulfilment';
@@ -15,6 +15,14 @@ export * from './fulfilment';
 // ── Journal line builders (also used for the projected journal on drafts) ──
 
 type PostLine = engine.PostLine;
+
+/** Effective dimensions of a document line: the header's values filled in, the line's own values on top (FR-SAL: item-wise dept / CC / project). */
+function lineDims(doc: Pick<DocHeader, 'dimensions'>, l: DocLine): Record<string, string> | undefined {
+  const d = { ...(doc.dimensions ?? {}), ...(l.dimensions ?? {}) };
+  return Object.keys(d).length ? d : undefined;
+}
+/** Map key that keeps lines with different dimensions apart so cost-centre splits survive aggregation. */
+const dimKey = (d?: Record<string, string>) => (d ? '|' + Object.keys(d).sort().map((k) => `${k}=${d[k]}`).join(',') : '');
 
 function addLine(map: Map<string, PostLine>, key: string, l: PostLine) {
   const prev = map.get(key);
@@ -31,16 +39,20 @@ export function invoiceJournalLines(inv: SalesInvoice): PostLine[] {
   addLine(m, 'ar', { accountId: arAccountFor(inv.partyId), dr: t.total, partyType: 'Customer', partyId: inv.partyId, partyName: inv.partyName, narration: `Invoice ${inv.number}` });
   inv.lines.forEach((l) => {
     const acc = salesAccountFor(l);
-    addLine(m, 'rev:' + acc, { accountId: acc, cr: l.taxable, dimensions: l.dimensions });
+    const dims = lineDims(inv, l);
+    addLine(m, 'rev:' + acc + dimKey(dims), { accountId: acc, cr: l.taxable, dimensions: dims });
     if (!l.reverseCharge) Object.entries(l.taxComponents ?? {}).forEach(([k, v]) => addLine(m, 'tax:' + k, { accountId: taxAccountFor(k, l.taxRateId), cr: v, taxComponent: k }));
   });
   (inv.charges ?? []).forEach((ch) => {
     addLine(m, 'chg:' + (ch.accountId ?? ACC.otherIncome), { accountId: ch.accountId ?? ACC.otherIncome, cr: ch.amount, narration: ch.name });
     if (ch.taxRateId) {
       const tx = engine.computeLineTax({ qty: 1, rate: ch.amount, taxRateId: ch.taxRateId }, taxContextForDoc(inv));
-      Object.entries(tx.components).forEach(([k, v]) => addLine(m, 'tax:' + k, { accountId: taxAccountFor(k, ch.taxRateId), cr: v, taxComponent: k }));
+      // reverse-charge tax on a charge is the recipient's liability — nothing to post here
+      if (!tx.reverseCharge) Object.entries(tx.components).forEach(([k, v]) => addLine(m, 'tax:' + k, { accountId: taxAccountFor(k, ch.taxRateId), cr: v, taxComponent: k }));
     }
   });
+  // An after-tax invoice discount leaves revenue and GST untouched and is expensed (Dr Discount allowed).
+  if (t.docDiscountAfterTax && (t.docDiscount ?? 0) > 0) addLine(m, 'disc', { accountId: discountAccountFor(), dr: t.docDiscount!, narration: 'Invoice discount (after tax)' });
   if (t.tds > 0) addLine(m, 'tds', { accountId: ACC.tdsReceivable, dr: t.tds, narration: `TDS ${t.tdsSection ?? ''}` });
   if (t.roundOff > 0) addLine(m, 'ro', { accountId: ACC.roundOff, cr: t.roundOff });
   if (t.roundOff < 0) addLine(m, 'ro', { accountId: ACC.roundOff, dr: -t.roundOff });
@@ -53,9 +65,11 @@ export function creditNoteJournalLines(cn: CreditNote): PostLine[] {
   const t = cn.totals;
   cn.lines.forEach((l) => {
     const acc = salesAccountFor(l);
-    addLine(m, 'rev:' + acc, { accountId: acc, dr: l.taxable, dimensions: l.dimensions });
-    Object.entries(l.taxComponents ?? {}).forEach(([k, v]) => addLine(m, 'tax:' + k, { accountId: taxAccountFor(k, l.taxRateId), dr: v, taxComponent: k }));
+    const dims = lineDims(cn, l);
+    addLine(m, 'rev:' + acc + dimKey(dims), { accountId: acc, dr: l.taxable, dimensions: dims });
+    if (!l.reverseCharge) Object.entries(l.taxComponents ?? {}).forEach(([k, v]) => addLine(m, 'tax:' + k, { accountId: taxAccountFor(k, l.taxRateId), dr: v, taxComponent: k }));
   });
+  if (t.docDiscountAfterTax && (t.docDiscount ?? 0) > 0) addLine(m, 'disc', { accountId: discountAccountFor(), cr: t.docDiscount!, narration: 'Invoice discount (after tax) reversed' });
   if (t.roundOff > 0) addLine(m, 'ro', { accountId: ACC.roundOff, dr: t.roundOff });
   if (t.roundOff < 0) addLine(m, 'ro', { accountId: ACC.roundOff, cr: -t.roundOff });
   addLine(m, 'ar', { accountId: arAccountFor(cn.partyId), cr: t.total, partyType: 'Customer', partyId: cn.partyId, partyName: cn.partyName, narration: `Credit note ${cn.number} against ${cn.invoiceNumber}` });
@@ -138,7 +152,7 @@ function applySourceInvoicing(inv: SalesInvoice, sign: 1 | -1, issued: StockIssu
 export function newInvoice(partial: Partial<SalesInvoice> = {}): SalesInvoice {
   const s = salesSettingsOf(engine.ctx().company?.defaults);
   const date = partial.date ?? today();
-  const base = engine.newDocHeader('Sales Invoice', { date, dueDate: engine.dueDateFor(date, s.salesDefaultTerms), paymentTerms: s.salesDefaultTerms, partyType: 'Customer', warehouseId: engine.ctx().company?.defaults.warehouseId, ...defaultTemplateFor('Sales Invoice'), ...partial });
+  const base = engine.newDocHeader('Sales Invoice', { date, dueDate: engine.dueDateFor(date, s.salesDefaultTerms), paymentTerms: s.salesDefaultTerms, partyType: 'Customer', warehouseId: engine.ctx().company?.defaults.warehouseId, ...defaultTemplateFor('Sales Invoice'), ...invoiceDefaults({ branchId: partial.branchId, voucherTypeId: partial.voucherTypeId }), ...partial });
   return { ...base, status: 'Draft', roundTotal: true } as SalesInvoice;
 }
 
@@ -204,18 +218,20 @@ export function postInvoice(id: string): SalesInvoice {
     issues.forEach((p) => {
       const pos = engine.stockPosition(p.item.id, p.warehouseId);
       if (!allowNeg && pos.onHand - p.qty < -0.0005) throw new ValidationError(`Insufficient stock for ${p.item.name}: on hand ${pos.onHand} ${p.item.baseUom}, invoice needs ${p.qty}`, 'NEGATIVE_STOCK', 'lines');
-      if (p.item.tracking === 'Serial' && (p.line.serials?.length ?? 0) !== p.qty) throw new ValidationError(`${p.item.name} is serial-tracked: ${p.qty} serial numbers required`, 'SERIAL_REQUIRED', 'lines');
+      const stockErrs = engine.validateLineStock(p.line, p.item, p.qty, { direction: 'out', warehouseId: p.warehouseId, itemId: p.item.id, allowNegative: allowNeg });
+      if (stockErrs.length) throw new ValidationError(stockErrs.join('; '), p.item.tracking === 'Serial' ? 'SERIAL_REQUIRED' : 'BATCH_REQUIRED', 'lines');
     });
-    const number = inv.number.includes('DRAFT') || !inv.number ? engine.allocateNumber('Sales Invoice', { date: inv.date, branchId: inv.branchId }) : inv.number;
+    const number = inv.number.includes('DRAFT') || !inv.number ? engine.allocateNumber('Sales Invoice', { date: inv.date, branchId: inv.branchId, voucherTypeId: inv.voucherTypeId }) : inv.number;
     const idem = `inv:${inv.id}:post`;
     const j = engine.postJournal({ date: inv.date, branchId: inv.branchId, currency: inv.currency, rate: inv.rate || 1, lines: invoiceJournalLines(inv), sourceType: 'Sales Invoice', sourceId: inv.id, sourceNumber: number, narration: `Sales invoice ${number} · ${inv.partyName ?? ''}`, idempotencyKey: idem, correlationId: inv.correlationId });
-    const issueMoves = issues.map((p) => engine.moveStock({ date: inv.date, itemId: p.item.id, warehouseId: p.warehouseId, qty: -p.qty, uom: p.line.uom, type: 'Delivery', sourceType: 'Sales Invoice', sourceId: inv.id, sourceNumber: number, batch: p.line.batch, serials: p.line.serials }));
+    // one movement per batch / lot / serial slice so the stock ledger stays batch-accurate (FR-INV: multi-lot issue)
+    const issueMoves = issues.flatMap((p) => engine.lineStockRows(p.line, p.qty).map((r) => engine.moveStock({ date: inv.date, itemId: p.item.id, warehouseId: p.warehouseId, qty: -r.qty, uom: p.line.uom, type: 'Delivery', sourceType: 'Sales Invoice', sourceId: inv.id, sourceNumber: number, batch: r.batch, serials: r.serials })));
     // relieve inventory control for what left the warehouse (FR-INV-008)
     engine.postCogsJournal({ date: inv.date, movements: issueMoves, sourceType: 'Sales Invoice', sourceId: inv.id, sourceNumber: number, branchId: inv.branchId, companyId: inv.companyId, correlationId: inv.correlationId });
     applySourceInvoicing(inv, 1, issues);
     const oi = engine.createOpenItem({ partyType: 'Customer', partyId: inv.partyId!, partyName: inv.partyName ?? '', docType: 'Sales Invoice', docId: inv.id, docNumber: number, date: inv.date, dueDate: inv.dueDate ?? inv.date, currency: inv.currency, originalAmount: inv.totals.total, baseAmount: inv.totals.baseTotal || inv.totals.total, rate: inv.rate || 1, direction: 'Debit', branchId: inv.branchId, companyId: inv.companyId });
     const co = engine.companyOf(inv.companyId);
-    const eInvApplicable = (co?.localizationPack ?? 'IN') === 'IN' && !!inv.partySnapshot?.gstin && inv.partySnapshot?.taxTreatment !== 'Unregistered';
+    const eInvApplicable = engine.eInvoiceApplicable(inv, co?.localizationPack);
     const hasGoods = inv.lines.some((l) => db.find<Item>(C.items, l.itemId)?.isStock);
     const statutory = { ...(inv.statutory ?? {}), eInvoiceStatus: eInvApplicable ? ('Pending' as const) : ('Not Applicable' as const), ewbStatus: hasGoods && (inv.totals.baseTotal || inv.totals.total) >= 50000 ? ('Pending' as const) : ('Not Applicable' as const) };
     // remember what each line actually issued so a reversal can undo exactly that (FR-3.4)
@@ -276,7 +292,7 @@ export function cancelInvoice(id: string, reason: string): SalesInvoice {
   if (inv.status === 'Posted' || inv.status === 'Reversed') throw new ValidationError('Posted invoices cannot be cancelled — reverse instead', 'INVALID_STATE');
   const pending = db.findBy<ApprovalRequest>(C.approvals, (a) => a.docId === inv.id && a.status === 'Pending');
   if (pending) db.update<ApprovalRequest>(C.approvals, pending.id, { status: 'Cancelled', completedAt: new Date().toISOString(), history: [...pending.history, { at: new Date().toISOString(), by: engine.ctx().userName, action: 'Cancelled with document', comment: reason }] });
-  if (!inv.number.includes('DRAFT')) engine.voidNumber('Sales Invoice', inv.number, reason);
+  if (!inv.number.includes('DRAFT')) engine.voidNumber('Sales Invoice', inv.number, reason, { branchId: inv.branchId, voucherTypeId: inv.voucherTypeId });
   const out = db.update<SalesInvoice>(C.salesInvoices, inv.id, { status: 'Cancelled', cancelReason: reason });
   engine.audit({ action: 'invoice.cancelled', objectType: 'Sales Invoice', objectId: inv.id, objectNumber: inv.number, detail: reason, correlationId: inv.correlationId });
   return out;
@@ -554,7 +570,7 @@ export function postCreditNote(id: string): CreditNote {
       const srNumber = engine.allocateNumber('Sales Return', { date: cn.date, branchId: cn.branchId });
       const sr = db.insert<SalesReturn>(C.salesReturns, { ...engine.newDocHeader('Sales Return', { date: cn.date, branchId: cn.branchId, currency: cn.currency, rate: cn.rate, partyType: 'Customer', partyId: cn.partyId, partyName: cn.partyName, partySnapshot: cn.partySnapshot, number: srNumber, sourceType: 'Credit Note', sourceId: cn.id, sourceNumber: number, warehouseId: wh, lines: cn.lines.filter((l) => db.find<Item>(C.items, l.itemId)?.isStock).map((l) => ({ ...l, id: uid('ln'), warehouseId: l.warehouseId ?? wh })), totals: cn.totals }), status: 'Posted', creditNoteId: cn.id, creditNoteNumber: number, invoiceId: cn.invoiceId, invoiceNumber: cn.invoiceNumber, reasonCode: cn.reasonCode, journalId: j.id, journalNumber: j.number, postedAt: new Date().toISOString(), postedBy: engine.ctx().userName } as any);
       salesReturnId = sr.id;
-      const returnMoves = sr.lines.map((l) => engine.moveStock({ date: cn.date, itemId: l.itemId!, warehouseId: l.warehouseId ?? wh, qty: l.qty, uom: l.uom, type: 'Sales Return', sourceType: 'Sales Return', sourceId: sr.id, sourceNumber: srNumber, batch: l.batch, serials: l.serials, rate: engine.stockPosition(l.itemId!, l.warehouseId ?? wh).avgRate || undefined }));
+      const returnMoves = sr.lines.flatMap((l) => engine.lineStockRows(l, l.qty).map((r) => engine.moveStock({ date: cn.date, itemId: l.itemId!, warehouseId: l.warehouseId ?? wh, qty: r.qty, uom: l.uom, type: 'Sales Return', sourceType: 'Sales Return', sourceId: sr.id, sourceNumber: srNumber, batch: r.batch, serials: r.serials, expiryDate: r.expiryDate, rate: engine.stockPosition(l.itemId!, l.warehouseId ?? wh).avgRate || undefined })));
       engine.postCogsJournal({ date: cn.date, movements: returnMoves, sourceType: 'Sales Return', sourceId: sr.id, sourceNumber: srNumber, branchId: cn.branchId, companyId: cn.companyId, correlationId: cn.correlationId });
     }
     db.update<SalesInvoice>(C.salesInvoices, inv.id, (prev) => ({ lines: prev.lines.map((x) => { const c = cn.lines.find((l) => l.sourceLineId === x.id); return c ? { ...x, returnedQty: round((x.returnedQty ?? 0) + c.qty, 3) } : x; }) }));
@@ -589,7 +605,7 @@ export function cancelCreditNote(id: string, reason: string) {
 /** Pre-fill a credit note from a posted invoice: every line with returnable quantity. */
 export function creditNoteFromInvoice(inv: SalesInvoice): CreditNote {
   const lines = inv.lines.filter((l) => returnableQty(l) > 0).map((l) => ({ ...l, id: uid('ln'), qty: returnableQty(l), sourceLineId: l.id, sourceDocId: inv.id, sourceQty: l.qty, remainingQty: returnableQty(l), deliveredQty: undefined, invoicedQty: undefined, returnedQty: undefined }));
-  const base = engine.newDocHeader('Credit Note', { date: today(), branchId: inv.branchId, currency: inv.currency, rate: inv.rate, partyType: 'Customer', partyId: inv.partyId, partyName: inv.partyName, partySnapshot: inv.partySnapshot, placeOfSupply: inv.placeOfSupply, placeOfSupplyCode: inv.placeOfSupplyCode, salespersonId: inv.salespersonId, priceListId: inv.priceListId, sourceType: 'Sales Invoice', sourceId: inv.id, sourceNumber: inv.number, lines, dimensions: inv.dimensions, warehouseId: inv.warehouseId });
+  const base = engine.newDocHeader('Credit Note', { date: today(), branchId: inv.branchId, currency: inv.currency, rate: inv.rate, partyType: 'Customer', partyId: inv.partyId, partyName: inv.partyName, partySnapshot: inv.partySnapshot, placeOfSupply: inv.placeOfSupply, placeOfSupplyCode: inv.placeOfSupplyCode, salespersonId: inv.salespersonId, priceListId: inv.priceListId, sourceType: 'Sales Invoice', sourceId: inv.id, sourceNumber: inv.number, lines, dimensions: inv.dimensions, warehouseId: inv.warehouseId, invoiceType: inv.invoiceType, reverseCharge: inv.reverseCharge, voucherTypeId: inv.voucherTypeId, bankAccountId: inv.bankAccountId, docDiscount: inv.docDiscount, showChargeBreakup: inv.showChargeBreakup });
   const cn: CreditNote = { ...base, status: 'Draft', invoiceId: inv.id, invoiceNumber: inv.number, reasonCode: '', goodsReturn: false, returnWarehouseId: inv.warehouseId ?? engine.ctx().company?.defaults.warehouseId };
   return recompute(cn, { roundTotal: true });
 }

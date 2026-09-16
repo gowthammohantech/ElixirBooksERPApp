@@ -232,7 +232,7 @@ export const MASTERS_NAV: SubNavItem[] = [
 
 export const ADMIN_PERMS: Record<string, string> = {
   company: 'admin.company.view', companies: 'admin.company.view', branches: 'admin.branches.view', periods: 'admin.periods.view', defaults: 'admin.company.view',
-  users: 'admin.users.view', roles: 'admin.roles.view', numbering: 'admin.numbering.view', workflows: 'admin.workflows.view', templates: 'admin.templates.view',
+  users: 'admin.users.view', roles: 'admin.roles.view', numbering: 'admin.numbering.view', 'voucher-types': 'admin.numbering.view', workflows: 'admin.workflows.view', templates: 'admin.templates.view',
   profile: 'admin.company.view', localization: 'admin.company.view', plan: 'admin.company.view', audit: 'admin.audit.view', integrations: 'admin.integrations.view',
   jobs: 'admin.jobs.view', notifications: 'admin.company.view', data: 'admin.data.view',
 };
@@ -256,6 +256,7 @@ export function adminNav(s: Scope): SubNavItem[] {
     { id: 'users', label: 'Users & access', group: 'Access', hidden: !visible('users') },
     { id: 'roles', label: 'Roles & permissions', group: 'Access', hidden: !visible('roles') },
     { id: 'numbering', label: 'Number series', group: 'Documents', hidden: !visible('numbering') },
+    { id: 'voucher-types', label: 'Voucher types', group: 'Documents', hidden: !visible('voucher-types') },
     { id: 'workflows', label: 'Workflows', group: 'Documents', hidden: !visible('workflows') },
     { id: 'templates', label: 'Document templates', group: 'Documents', hidden: !visible('templates') },
     { id: 'localization', label: 'Localization', group: 'Platform', hidden: !visible('localization') },

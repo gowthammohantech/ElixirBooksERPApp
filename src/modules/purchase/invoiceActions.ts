@@ -84,7 +84,18 @@ export function validateVendorInvoice(v: VendorInvoice): Record<string, string> 
   if (!v.supplierInvoiceDate) e.supplierInvoiceDate = 'Supplier invoice date is required';
   if (v.supplierInvoiceDate && v.supplierInvoiceDate > v.date) e.supplierInvoiceDate = 'Supplier invoice date cannot be after the booking date';
   if (!v.lines.length) e.lines = 'Add at least one line';
-  v.lines.forEach((l, i) => { if (!l.itemId && !l.itemName) e[`line.${i}`] = `Line ${i + 1}: choose an item`; else if (l.qty <= 0) e[`line.${i}`] = `Line ${i + 1}: quantity must be positive`; else if (l.remainingQty !== undefined && l.qty > l.remainingQty + 0.0005) e[`line.${i}`] = `Line ${i + 1}: exceeds eligible ${l.remainingQty}`; });
+  const direct = purchaseSettings().directInvoiceStock;
+  v.lines.forEach((l, i) => {
+    if (!l.itemId && !l.itemName) e[`line.${i}`] = `Line ${i + 1}: choose an item`;
+    else if (l.qty <= 0) e[`line.${i}`] = `Line ${i + 1}: quantity must be positive`;
+    else if (l.remainingQty !== undefined && l.qty > l.remainingQty + 0.0005) e[`line.${i}`] = `Line ${i + 1}: exceeds eligible ${l.remainingQty}`;
+    else if (direct && !l.grnId) {
+      // a direct-stock bill receives stock itself, so its batch / lot / serial split must be complete
+      const item = db.find<Item>(C.items, l.itemId);
+      const m = item?.isStock && item.type !== 'Service' ? engine.validateLineStock(l, item, l.qty, { direction: 'in' }) : [];
+      if (m.length) e[`line.${i}`] = `Line ${i + 1}: ${m[0]}`;
+    }
+  });
   const dup = findDuplicateInvoice(v);
   if (dup) e.supplierInvoiceNumber = `Duplicate: ${dup.supplierInvoiceNumber} already booked as ${dup.number} (${dup.status})`;
   return e;
@@ -242,7 +253,7 @@ export function postVendorInvoice(id: string): VendorInvoice {
     // direct stock receipt (no GRN) when policy allows
     v.lines.forEach((l) => {
       const item = db.find<Item>(C.items, l.itemId);
-      if (!l.grnId && item?.isStock && item.type !== 'Service' && s.directInvoiceStock && l.warehouseId) engine.moveStock({ date: v.date, itemId: item.id, warehouseId: l.warehouseId, qty: l.qty, uom: l.uom, rate: r2((l.taxable / l.qty) * v.rate), type: 'GRN', sourceType: 'Vendor Invoice', sourceId: v.id, sourceNumber: number, batch: l.batch, serials: l.serials });
+      if (!l.grnId && item?.isStock && item.type !== 'Service' && s.directInvoiceStock && l.warehouseId) engine.lineStockRows(l, l.qty).forEach((r) => engine.moveStock({ date: v.date, itemId: item.id, warehouseId: l.warehouseId!, qty: r.qty, uom: l.uom, rate: r2((l.taxable / l.qty) * v.rate), type: 'GRN', sourceType: 'Vendor Invoice', sourceId: v.id, sourceNumber: number, batch: r.batch, serials: r.serials, expiryDate: r.expiryDate }));
     });
     const j = engine.postJournal({ date: v.date, branchId: v.branchId, currency: v.currency, rate: v.rate, sourceType: 'Vendor Invoice', sourceId: v.id, sourceNumber: number, narration: `Vendor invoice ${number} · ${v.partyName} · ${v.supplierInvoiceNumber}`, idempotencyKey: `${v.id}:post`, lines: vendorInvoiceJournalLines({ ...v, number }) });
     const oi = engine.createOpenItem({ partyType: 'Supplier', partyId: v.partyId!, partyName: v.partyName!, docType: 'Vendor Invoice', docId: v.id, docNumber: number, date: v.date, dueDate: v.dueDate ?? engine.dueDateFor(v.date, v.paymentTerms), currency: v.currency, originalAmount: v.totals.total, baseAmount: v.totals.baseTotal, rate: v.rate, direction: 'Debit', branchId: v.branchId, companyId: v.companyId });
@@ -401,7 +412,7 @@ export function postDebitNote(input: DebitNote): DebitNote {
       prtId = prt.id;
       d.lines.forEach((l) => {
         const item = db.find<Item>(C.items, l.itemId);
-        if (item?.isStock && item.type !== 'Service') engine.moveStock({ date: d.date, itemId: item.id, warehouseId: l.warehouseId ?? d.returnWarehouseId!, qty: -l.qty, uom: l.uom, rate: r2((l.qty ? l.taxable / l.qty : l.rate) * d.rate), type: 'Purchase Return', sourceType: 'Purchase Return', sourceId: prt.id, sourceNumber: prtNumber!, batch: l.batch, serials: l.serials });
+        if (item?.isStock && item.type !== 'Service') engine.lineStockRows(l, l.qty).forEach((r) => engine.moveStock({ date: d.date, itemId: item.id, warehouseId: l.warehouseId ?? d.returnWarehouseId!, qty: -r.qty, uom: l.uom, rate: r2((l.qty ? l.taxable / l.qty : l.rate) * d.rate), type: 'Purchase Return', sourceType: 'Purchase Return', sourceId: prt.id, sourceNumber: prtNumber!, batch: r.batch, serials: r.serials }));
       });
     }
     d.lines.forEach((l) => {

@@ -38,7 +38,7 @@ export function setupSections(s: Scope, visibleModules: string[]): SetupSection[
   const organization: SetupCard[] = [
     ...card('org', 'Organization', BuildingIcon, 'accent', [...a('company'), ...a('profile'), ...a('branches'), ...a('companies'), ...a('plan'), ...a('localization')]),
     ...card('users', 'Users & Roles', UsersIcon, 'danger', [...a('users'), ...a('roles'), { id: 'setup/preferences', label: 'User preferences', keywords: 'appearance theme dark light density compact' }]),
-    ...card('config', 'Setup & Configurations', CogIcon, 'warn', [...a('periods'), ...a('defaults'), ...a('numbering'), ...m('currencies'), ...m('exchange-rates'), ...m('payment-terms'), ...(visibleModules.includes('accounting') ? [{ id: 'accounting/opening-balances', label: 'Opening balances' }] : [])]),
+    ...card('config', 'Setup & Configurations', CogIcon, 'warn', [...a('periods'), ...a('defaults'), ...a('numbering'), ...a('voucher-types'), ...m('currencies'), ...m('exchange-rates'), ...m('payment-terms'), ...(visibleModules.includes('accounting') ? [{ id: 'accounting/opening-balances', label: 'Opening balances' }] : [])]),
     ...card('tax', 'Taxes & Compliance', PercentIcon, 'info', [...m('tax-rates'), ...m('tds'), ...m('hsn')]),
     ...card('custom', 'Customization', EditIcon, 'violet', [...a('templates'), ...a('notifications'), ...m('dimensions'), ...m('reason-codes')]),
     ...card('automation', 'Automation', ZapIcon, 'good', [...a('workflows'), ...a('jobs')]),

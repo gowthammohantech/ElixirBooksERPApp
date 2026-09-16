@@ -8,7 +8,7 @@ import { fmtDate, fmtDateTime, fmtMoney, today } from '../../../lib/format';
 import { PrintIcon, SendIcon, CheckCircleIcon, ShieldCheckIcon } from '../../../components/Icons';
 import type { SalesInvoice } from '../types';
 import { DocDetailsTab, docHeaderRows, SalesRail, StatutoryBadges, PdfPreviewModal, EmailDialog, SettlementsPanel, StockMovesPanel, overdueDays, useOpenItemFor } from '../common';
-import { submitInvoice, postInvoice, cancelInvoice, deleteDraftInvoice, reverseInvoice, reverseBlockReason, writeOffInvoice, invoiceJournalLines, invoiceNeedsWorkflow, stockIssuesFor, generateEInvoice, cancelIrn, generateEwb, cancelEwb, applyCreditToInvoice, customerCredits, saveInvoice } from '../actions';
+import { submitInvoice, postInvoice, cancelInvoice, deleteDraftInvoice, reverseInvoice, reverseBlockReason, writeOffInvoice, invoiceJournalLines, invoiceNeedsWorkflow, stockIssuesFor, generateEInvoice, cancelIrn, generateEwb, cancelEwb, applyCreditToInvoice, customerCredits, saveInvoice, invoiceTitle } from '../actions';
 import ReceiptDrawer from '../receipts/ReceiptDrawer';
 
 export default function InvoiceDetail({ id, tab, onTab }: { id: string; tab?: string; onTab?: (t: string) => void }) {
@@ -122,7 +122,7 @@ export default function InvoiceDetail({ id, tab, onTab }: { id: string; tab?: st
     <>
       <DocumentPage
         backLabel="Sales invoices" onBack={() => nav.go('sales/invoices')} number={inv.number}
-        badges={<><Badge status={inv.status} />{posted && <StatutoryBadges doc={inv} />}{inv.reversalOfId && <Badge status="Reversed">Reversal</Badge>}</>}
+        badges={<><Badge status={inv.status} />{inv.reverseCharge && <Badge status="Pending">Reverse charge</Badge>}{inv.invoiceType && inv.invoiceType !== 'Regular' && <Badge status="Draft">{engine.invoiceTypeInfo(inv.invoiceType).short}</Badge>}{posted && <StatutoryBadges doc={inv} />}{inv.reversalOfId && <Badge status="Reversed">Reversal</Badge>}</>}
         amount={{ label: 'Total', value: inv.totals.total, currency: inv.currency, base: inv.currency !== s.currency ? inv.totals.baseTotal : undefined, baseCurrency: s.currency, rate: inv.rate }}
         due={posted ? { label: 'Due', value: inv.totals.due, currency: inv.currency, dueDate: inv.dueDate, overdueDays: overdue } : undefined}
         rail={<SalesRail doc={inv} showStatutory>
@@ -131,7 +131,7 @@ export default function InvoiceDetail({ id, tab, onTab }: { id: string; tab?: st
         activeTab={tab} onTab={onTab}
         banner={banner}
         tabs={[
-          { id: 'details', label: 'Details', content: <DocDetailsTab doc={inv} header={headerRows} showWarehouse showBatch={inv.lines.some((l) => l.batch || l.serials?.length)} sourceLinked={!!inv.sourceId} lineExtraColumns={posted ? [{ key: 'ret', label: 'Returned', render: (l: any) => (l.returnedQty ? `${l.returnedQty}` : '—') }] : undefined} extra={<>{posted && <SettlementsPanel openItem={oi} currency={inv.currency} />}{posted && <StockMovesPanel sourceId={inv.id} />}{!posted && issues.length > 0 && <Card padding={14} title="Stock to be issued on post"><KV items={issues.map((p) => ({ k: p.item.name, v: `${p.qty} ${p.item.baseUom} from ${db.find<any>(C.warehouses, p.warehouseId)?.name}` }))} /></Card>}</>} /> },
+          { id: 'details', label: 'Details', content: <DocDetailsTab doc={inv} header={headerRows} showWarehouse showBatch={inv.lines.some((l) => l.batch || l.serials?.length || l.breakup?.length)} sourceLinked={!!inv.sourceId} lineExtraColumns={posted ? [{ key: 'ret', label: 'Returned', render: (l: any) => (l.returnedQty ? `${l.returnedQty}` : '—') }] : undefined} extra={<>{posted && <SettlementsPanel openItem={oi} currency={inv.currency} />}{posted && <StockMovesPanel sourceId={inv.id} />}{!posted && issues.length > 0 && <Card padding={14} title="Stock to be issued on post"><KV items={issues.map((p) => ({ k: p.item.name, v: `${p.qty} ${p.item.baseUom} from ${db.find<any>(C.warehouses, p.warehouseId)?.name}` }))} /></Card>}</>} /> },
           { id: 'approvals', label: 'Approvals', content: <ApprovalsTab approvalId={inv.approvalId} docId={inv.id} /> },
           { id: 'accounting', label: 'Accounting', content: <AccountingTab journalId={inv.journalId} projected={!inv.journalId ? invoiceJournalLines(inv) : undefined} currency={inv.currency} /> },
           { id: 'activity', label: 'Activity', content: <ActivityTab objectId={inv.id} correlationId={inv.correlationId} /> },
@@ -139,7 +139,7 @@ export default function InvoiceDetail({ id, tab, onTab }: { id: string; tab?: st
         footer={footer}
       />
 
-      <PdfPreviewModal open={pdf} onClose={() => setPdf(false)} doc={inv} title="Tax invoice" />
+      <PdfPreviewModal open={pdf} onClose={() => setPdf(false)} doc={inv} title={invoiceTitle(inv)} />
       <EmailDialog open={email} onClose={() => setEmail(false)} doc={inv} collection={C.salesInvoices} />
       {receipt && <ReceiptDrawer open onClose={() => setReceipt(false)} customerId={inv.partyId} invoiceId={inv.id} onPosted={() => setReceipt(false)} />}
       <EInvoicePanel open={einv} onClose={() => setEinv(false)} inv={inv} />
@@ -147,7 +147,7 @@ export default function InvoiceDetail({ id, tab, onTab }: { id: string; tab?: st
       <ApplyCreditModal open={credit} onClose={() => setCredit(false)} inv={inv} credits={credits.filter((c) => openItems.some((o) => o.id === c.id))} />
 
       <ConfirmDialog open={dialog === 'post'} onClose={() => setDialog(null)} title={`Post invoice ${inv.number.includes('DRAFT') ? '' : inv.number}?`} statement="Posting allocates the number, creates the receivable and journal and issues stock. It cannot be undone — reverse instead." confirmLabel="Post invoice" cancelLabel="Keep as draft" disabled={busy}
-        consequences={[{ engine: 'Numbering', text: `Number ${engine.previewNumber('Sales Invoice', { date: inv.date, branchId: inv.branchId })} will be allocated` }, { engine: 'Journal', text: `Dr AR ${fmtMoney(inv.totals.total, inv.currency)} · Cr Sales ${fmtMoney(inv.totals.taxable, inv.currency)} · Cr Output tax ${fmtMoney(inv.totals.tax, inv.currency)}` }, ...(issues.length ? [{ engine: 'Stock', text: `${issues.length} line(s) issued from stock` }] : []), { engine: 'Open items', text: `Receivable due ${fmtDate(inv.dueDate)}` }]}
+        consequences={[{ engine: 'Numbering', text: `Number ${engine.previewNumber('Sales Invoice', { date: inv.date, branchId: inv.branchId, voucherTypeId: inv.voucherTypeId })} will be allocated` }, { engine: 'Journal', text: `Dr AR ${fmtMoney(inv.totals.total, inv.currency)} · Cr Sales ${fmtMoney(inv.totals.taxable, inv.currency)} · Cr Output tax ${fmtMoney(inv.totals.tax, inv.currency)}` }, ...(inv.totals.rcmTax ? [{ engine: 'Tax', text: `Reverse charge: ${fmtMoney(inv.totals.rcmTax, inv.currency)} payable by the recipient — not posted`, tone: 'warning' as const }] : []), ...(issues.length ? [{ engine: 'Stock', text: `${issues.length} line(s) issued from stock` }] : []), { engine: 'Open items', text: `Receivable due ${fmtDate(inv.dueDate)}` }]}
         onConfirm={() => { if (busy) return; setBusy(true); try { const out = postInvoice(inv.id); toast.success(`Invoice ${out.number} posted`); } finally { setBusy(false); } }} />
 
       <ConfirmDialog open={dialog === 'reverse'} onClose={() => setDialog(null)} title={`Reverse invoice ${inv.number}?`} statement="This creates a linked reversal document and cannot be undone." confirmLabel="Reverse invoice" cancelLabel="Keep invoice" danger reasonRequired

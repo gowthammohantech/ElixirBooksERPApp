@@ -6,7 +6,7 @@ import type { Column, MenuAction } from '../../../components/ui';
 import { fmtDate, fmtMoney, today, daysBetween, downloadText, toCSV } from '../../../lib/format';
 import type { SalesInvoice } from '../types';
 import { useCompanyDocs, StatutoryBadges, PdfPreviewModal } from '../common';
-import { submitInvoice, postInvoice, cancelInvoice, deleteDraftInvoice, invoiceNeedsWorkflow } from '../actions';
+import { submitInvoice, postInvoice, cancelInvoice, deleteDraftInvoice, invoiceNeedsWorkflow, invoiceTitle } from '../actions';
 
 const isOverdue = (i: SalesInvoice) => (i.status === 'Posted') && i.totals.due > 0 && !!i.dueDate && i.dueDate < today();
 
@@ -104,7 +104,7 @@ export default function InvoiceRegister() {
         bulkActions={bulk}
         rowClass={(r) => (r.status === 'Cancelled' || r.status === 'Reversed' ? 'muted' : undefined)}
       />
-      {pdf && <PdfPreviewModal open onClose={() => setPdf(null)} doc={pdf} title="Tax invoice" />}
+      {pdf && <PdfPreviewModal open onClose={() => setPdf(null)} doc={pdf} title={invoiceTitle(pdf)} />}
       <ConfirmDialog
         open={!!confirm}
         onClose={() => setConfirm(null)}

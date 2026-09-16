@@ -13,6 +13,7 @@ import Users from './Users';
 import UserDetail from './UserDetail';
 import Roles from './Roles';
 import Numbering from './Numbering';
+import VoucherTypes from './VoucherTypes';
 import Workflows from './Workflows';
 import Templates from './Templates';
 import BusinessProfile from './BusinessProfile';
@@ -44,6 +45,7 @@ export default function Module({ route }: ModuleProps) {
             case 'users': return route.id ? <UserDetail id={route.id} /> : <Users />;
             case 'roles': return <Roles id={route.id || undefined} />;
             case 'numbering': return <Numbering />;
+            case 'voucher-types': return <VoucherTypes />;
             case 'workflows': return <Workflows />;
             case 'templates': return <Templates />;
             case 'localization': return <Localization />;

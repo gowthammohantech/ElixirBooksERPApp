@@ -84,6 +84,10 @@ export interface GstRegisterRow {
   party: string;
   gstin?: string;
   treatment?: string;
+  /** document supply type (e-invoice SupTyp); undefined on documents created before invoice types existed */
+  supplyType?: string;
+  /** tax shown under reverse charge (payable by the recipient) */
+  rcmTax?: number;
   pos: string;
   posCode?: string;
   taxable: number;
