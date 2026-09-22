@@ -12,7 +12,7 @@ interface LoginProps {
 }
 
 export default function Login({ onLogin, onCreateAccount }: LoginProps) {
-  const [email, setEmail] = useState('rahul@elixirbusiness.in');
+  const [email, setEmail] = useState('aarav@elixirglobal.in');
   const [password, setPassword] = useState('••••••••••');
   const [agreed, setAgreed] = useState(true);
   const [loading, setLoading] = useState(false);
